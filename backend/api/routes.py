@@ -14,6 +14,7 @@ from db import (
     save_agent_run, list_agent_runs,
 )
 from data.seed import DEMO_SCENARIOS, CAMPUS_RESOURCES
+from runtime import get_runtime
 
 router = APIRouter()
 
@@ -180,3 +181,46 @@ async def load_demo_scenario(scenario_id: str):
 @router.get("/demo/resources")
 async def list_campus_resources():
     return CAMPUS_RESOURCES
+
+
+# --- Debug ---
+
+@router.get("/debug/dedalus")
+async def debug_dedalus():
+    """Probe Dedalus API directly — lists machines, confirms key is working."""
+    import os
+    api_key = os.getenv("DEDALUS_API_KEY")
+    result: dict = {
+        "sdk_available": False,
+        "api_key_present": bool(api_key),
+        "runtime": get_runtime().runtime_name(),
+        "machines": [],
+        "error": None,
+    }
+
+    try:
+        import dedalus_sdk
+        result["sdk_available"] = True
+    except ImportError:
+        result["error"] = "dedalus_sdk not installed"
+        return result
+
+    if not api_key:
+        result["error"] = "DEDALUS_API_KEY not set"
+        return result
+
+    try:
+        client = dedalus_sdk.AsyncDedalus(api_key=api_key)
+        page = await client.machines.list()
+        machines = []
+        async for m in page:
+            machines.append({
+                "machine_id": m.machine_id,
+                "phase": m.status.phase if m.status else "unknown",
+            })
+        result["machines"] = machines
+        result["machine_count"] = len(machines)
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result

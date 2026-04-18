@@ -1,15 +1,34 @@
 """
-Orchestrates the four specialist agents sequentially, preceded by external data
-enrichment (ArcGIS, NWS, OpenFEMA). External context flows into every agent prompt.
+Sentinel IAP Orchestrator — 3-phase parallel execution on persistent Dedalus swarm.
+
+Swarm machine layout:
+  Situation Unit machine    → incident_parser
+  Intelligence machine      → risk_assessor (K2 Think V2) → action_planner (K2 Think V2)
+  Communications machine    → communications_agent
+
+Execution flow:
+  Phase 1 (parallel): Situation Unit + external context enrichment
+  Phase 2:            Intelligence machine — risk_assessor (K2 deep reasoning)
+  Phase 3 (parallel): Intelligence machine — action_planner (K2 routing + triage)
+                      Communications machine — communications_agent
+
+K2 Think V2 is the core reasoning engine for the Intelligence machine (risk + planner).
+These are the two most analytically complex steps: threat escalation reasoning and
+routing-aware operational planning under triage constraints.
+
+Target total latency: ~45s (3 × ~15s LLM phases)
 """
 from __future__ import annotations
+import asyncio
 import json
+import time
+import traceback as _traceback
 from datetime import datetime
 from typing import Optional
 
 from models.incident import Incident
 from models.plan import (
-    PlanVersion, PlanDiff, ActionItem, RoleAssignment, CommunicationDraft, Assumption,
+    PlanVersion, PlanDiff, ActionItem, CommunicationDraft, Assumption,
     MedicalImpact, TriagePriority, PatientTransport,
 )
 from models.agent import AgentRun, AgentType
@@ -20,7 +39,8 @@ from agents.llm import call_llm
 from agents.prompts import REPLAN_CONTEXT_PROMPT
 from services import gather_external_context
 from runtime import get_runtime
-from db import save_agent_run
+from runtime.dedalus_runtime import AGENT_ROLE_MAP, ROLE_LABELS
+from db import save_agent_run, list_swarm_machines
 
 
 def _make_run(incident: Incident, version: int, agent_type: AgentType, snapshot: dict) -> AgentRun:
@@ -122,10 +142,8 @@ def _all_actions(plan: PlanVersion) -> list[ActionItem]:
 def _generate_diff(prev: PlanVersion, curr: PlanVersion) -> PlanDiff:
     prev_descs = {a.description for a in _all_actions(prev)}
     curr_descs = {a.description for a in _all_actions(curr)}
-
     added = [a for a in _all_actions(curr) if a.description not in prev_descs]
     removed = [a for a in _all_actions(prev) if a.description not in curr_descs]
-
     changed_sections = []
     if prev.operational_priorities != curr.operational_priorities:
         changed_sections.append("operational_priorities")
@@ -137,7 +155,6 @@ def _generate_diff(prev: PlanVersion, curr: PlanVersion) -> PlanDiff:
         changed_sections.append("ongoing_actions")
     if prev.assessed_severity != curr.assessed_severity:
         changed_sections.append("severity")
-
     return PlanDiff(
         from_version=prev.version,
         to_version=curr.version,
@@ -150,6 +167,44 @@ def _generate_diff(prev: PlanVersion, curr: PlanVersion) -> PlanDiff:
     )
 
 
+def _print_swarm_truth(agent_runs: list[AgentRun], elapsed_ms: int) -> None:
+    """Print an unambiguous Dedalus swarm status block at end of each analyze."""
+    runtimes = {r.agent_type: r.runtime for r in agent_runs}
+    machines = {r.agent_type: r.machine_id for r in agent_runs if r.machine_id}
+    swarm = list_swarm_machines()  # role → machine_id from SQLite
+
+    # Artifact counts per run
+    def artifact_count(run: AgentRun) -> int:
+        return sum(1 for e in (run.log_entries or []) if "✓ Artifact" in e)
+
+    healthy = [r for r in agent_runs if r.runtime == "dedalus"]
+    degraded = [r for r in agent_runs if r.runtime == "dedalus_degraded"]
+    local = [r for r in agent_runs if r.runtime == "local"]
+
+    if len(healthy) == len(agent_runs):
+        status = f"HEALTHY — all {len(healthy)} agents on Dedalus machines ({elapsed_ms}ms)"
+    elif degraded or healthy:
+        status = f"PARTIAL — {len(healthy)} healthy / {len(degraded)} degraded / {len(local)} local ({elapsed_ms}ms)"
+    else:
+        status = f"FALLBACK — no Dedalus involvement ({elapsed_ms}ms)"
+
+    print(f"\n{'─'*60}")
+    print(f"  Dedalus Swarm: {status}")
+    print(f"  Swarm machines registered:")
+    for role, mid in swarm.items():
+        print(f"    {ROLE_LABELS.get(role, role):<28} {mid[:12]} (role={role})")
+    if not swarm:
+        print("    (none)")
+    print(f"  Per-agent:")
+    for run in agent_runs:
+        role = AGENT_ROLE_MAP.get(run.agent_type, "?")
+        mid = machines.get(run.agent_type, "none")[:12]
+        art = artifact_count(run)
+        k2 = " [K2 Think V2]" if role == "intelligence" else ""
+        print(f"    {run.agent_type:<22} runtime={run.runtime:<18} machine={mid}  artifacts={art}{k2}")
+    print(f"{'─'*60}\n")
+
+
 async def generate_plan(
     incident: Incident,
     version: int,
@@ -159,26 +214,54 @@ async def generate_plan(
     runtime = get_runtime()
     agent_runs: list[AgentRun] = []
     resources_raw = [r.model_dump() for r in incident.resources]
+    t_pipeline = time.monotonic()
 
-    # --- Gather external context BEFORE any agent runs ---
-    ext_ctx = await gather_external_context(incident.location)
+    print(f"\n[{datetime.utcnow().strftime('%H:%M:%S')}] ═══ START ANALYZE incident={incident.id[:8]} v{version} ═══")
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Runtime: {runtime.runtime_name()} | Swarm machines: {list_swarm_machines()}")
 
     full_report = incident.report if not update_text else f"{incident.report}\n\nFIELD UPDATE: {update_text}"
 
-    # --- Agent 1: Planning Section (Incident Parser) ---
+    def _elapsed(t: float) -> str:
+        return f"{int((time.monotonic() - t) * 1000)}ms"
+
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 1 (parallel)
+    # Situation Unit machine: incident_parser
+    # External enrichment: geocode + weather + FEMA + routing
+    # ═══════════════════════════════════════════════════════════
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ── PHASE 1: Situation Unit + external context (parallel) ──")
+    t1 = time.monotonic()
+
     run1 = _make_run(incident, version, AgentType.INCIDENT_PARSER, {
         "incident_type": incident.incident_type,
         "report": full_report,
         "location": incident.location,
         "severity_hint": incident.severity_hint,
         "resources": resources_raw,
-        "external_context": ext_ctx,
+        "external_context": {},
     })
-    run1 = await runtime.execute(run1, run_incident_parser)
+
+    run1, ext_ctx = await asyncio.gather(
+        runtime.execute(run1, run_incident_parser),
+        gather_external_context(incident.location),
+    )
     agent_runs.append(run1)
     parsed = run1.output_artifact or {}
 
-    # --- Agent 2: Intelligence/Planning Section (Risk Assessor) ---
+    if run1.status.value == "failed":
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] incident_parser FAILED ({_elapsed(t1)}): {run1.error_message}")
+    else:
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] PHASE 1 done ({_elapsed(t1)}) | parser={run1.runtime} machine={run1.machine_id[:12] if run1.machine_id else 'none'}")
+
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 2
+    # Intelligence machine: risk_assessor via K2 Think V2
+    # Full weather + FEMA context feeds threat analysis.
+    # Sequential: risk must complete before planner.
+    # ═══════════════════════════════════════════════════════════
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ── PHASE 2: Intelligence / K2 Think V2 — threat analysis ──")
+    t2 = time.monotonic()
+
     run2 = _make_run(incident, version, AgentType.RISK_ASSESSOR, {
         "parsed_data": parsed,
         "resources": resources_raw,
@@ -188,7 +271,22 @@ async def generate_plan(
     agent_runs.append(run2)
     risk = run2.output_artifact or {}
 
-    # --- Agent 3: Operations Section (Action Planner) ---
+    if run2.status.value == "failed":
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] risk_assessor FAILED ({_elapsed(t2)}): {run2.error_message}")
+    else:
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] PHASE 2 done ({_elapsed(t2)}) | risk={run2.runtime} machine={run2.machine_id[:12] if run2.machine_id else 'none'}")
+
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 3 (parallel)
+    # Intelligence machine: action_planner (K2 Think V2)
+    #   — routing-aware ops planning, triage, patient transport
+    # Communications machine: communications_agent
+    #   — uses parsed situation + risk severity (not planner output)
+    #     to run in parallel; comms is formatting-heavy not logic-heavy
+    # ═══════════════════════════════════════════════════════════
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ── PHASE 3: Operations Planner (K2) + Communications (parallel) ──")
+    t3 = time.monotonic()
+
     run3 = _make_run(incident, version, AgentType.ACTION_PLANNER, {
         "parsed_data": parsed,
         "risk_data": risk,
@@ -196,23 +294,44 @@ async def generate_plan(
         "location": incident.location,
         "external_context": ext_ctx,
     })
-    run3 = await runtime.execute(run3, run_action_planner)
-    agent_runs.append(run3)
-    plan_raw = run3.output_artifact or {}
 
-    # --- Agent 4: Public Information Officer (Communications) ---
+    # Comms runs in parallel with planner on its own machine.
+    # It receives the parsed situation + risk severity rather than waiting
+    # for the planner's polished summary — acceptable for demo and real-world
+    # use where speed matters. Key facts (location, hazards, injuries) are
+    # all available from phase 1 + 2 outputs.
+    preliminary_summary = (
+        f"{incident.incident_type} at {incident.location}. "
+        f"Affected: {parsed.get('affected_population', 'unknown')}. "
+        + (f"Injuries: {parsed.get('medical_impact', {}).get('estimated_injured', 'unknown')}. " if parsed.get('medical_impact') else "")
+        + f"Hazards: {', '.join(parsed.get('key_hazards', [])[:3])}."
+    )
     run4 = _make_run(incident, version, AgentType.COMMUNICATIONS, {
-        "incident_summary": plan_raw.get("incident_summary", ""),
+        "incident_summary": preliminary_summary,
         "severity": risk.get("severity_level", "unknown"),
         "location": incident.location,
-        "priorities": plan_raw.get("operational_priorities", []),
-        "missing_info": plan_raw.get("missing_information", []),
-        "triage_priorities": plan_raw.get("triage_priorities", []),
+        "priorities": risk.get("incident_objectives", []),
+        "missing_info": parsed.get("unknowns", []),
+        "triage_priorities": [],  # planner not done yet; comms uses hazard context only
         "external_context": ext_ctx,
     })
-    run4 = await runtime.execute(run4, run_communications_agent)
-    agent_runs.append(run4)
+
+    run3, run4 = await asyncio.gather(
+        runtime.execute(run3, run_action_planner),
+        runtime.execute(run4, run_communications_agent),
+    )
+    agent_runs.extend([run3, run4])
+    plan_raw = run3.output_artifact or {}
     comms = run4.output_artifact or {}
+
+    for label, run in [("action_planner", run3), ("communications", run4)]:
+        if run.status.value == "failed":
+            print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {label} FAILED: {run.error_message}")
+        else:
+            mid = run.machine_id[:12] if run.machine_id else "none"
+            print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {label} ok | runtime={run.runtime} machine={mid}")
+
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] PHASE 3 done ({_elapsed(t3)})")
 
     # --- Diff context for replanning ---
     diff_summary = None
@@ -229,7 +348,7 @@ async def generate_plan(
         except Exception:
             diff_summary = f"IAP revised based on field update: {update_text}"
 
-    # --- Build external context summary for the frontend ---
+    # --- External context summary for frontend ---
     weather = ext_ctx.get("weather", {})
     mapping = ext_ctx.get("mapping", {})
     fema = ext_ctx.get("fema", {})
@@ -270,6 +389,9 @@ async def generate_plan(
             {"name": h.get("name", ""), "distance_mi": h.get("distance_mi"), "trauma_level": h.get("trauma_level")}
             for h in hospitals[:4]
         ],
+        "swarm_machines": {
+            role: mid for role, mid in list_swarm_machines().items()
+        },
     }
 
     plan = PlanVersion(
@@ -288,7 +410,6 @@ async def generate_plan(
         ongoing_actions=_parse_action_items(plan_raw.get("ongoing_actions", [])),
 
         resource_assignments=plan_raw.get("resource_assignments"),
-
         safety_considerations=risk.get("safety_considerations", []),
 
         communications=_parse_communications(comms),
@@ -310,5 +431,8 @@ async def generate_plan(
         changed_sections=changed_sections,
         external_context=ext_summary,
     )
+
+    elapsed_ms = int((time.monotonic() - t_pipeline) * 1000)
+    _print_swarm_truth(agent_runs, elapsed_ms)
 
     return plan, agent_runs

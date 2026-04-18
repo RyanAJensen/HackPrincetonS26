@@ -50,7 +50,82 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS incident_machines (
+                incident_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS swarm_machines (
+                role TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
+
+
+# --- Incident Machines (Dedalus persistent machine registry) ---
+
+def get_incident_machine(incident_id: str) -> Optional[str]:
+    """Return the Dedalus machine_id for this incident, or None."""
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT machine_id FROM incident_machines WHERE incident_id=?", (incident_id,)
+        ).fetchone()
+        return row["machine_id"] if row else None
+
+
+def save_incident_machine(incident_id: str, machine_id: str):
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO incident_machines (incident_id, machine_id, created_at) VALUES (?, ?, ?)",
+            (incident_id, machine_id, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+
+
+def clear_incident_machine(incident_id: str):
+    """Remove the cached machine mapping for an incident (call when machine enters terminal state)."""
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM incident_machines WHERE incident_id=?", (incident_id,))
+        conn.commit()
+
+
+# --- Swarm Machines (persistent role-based machine pool) ---
+
+def get_swarm_machine(role: str) -> Optional[str]:
+    """Return the Dedalus machine_id assigned to a swarm role, or None."""
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT machine_id FROM swarm_machines WHERE role=?", (role,)
+        ).fetchone()
+        return row["machine_id"] if row else None
+
+
+def save_swarm_machine(role: str, machine_id: str):
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO swarm_machines (role, machine_id, created_at) VALUES (?, ?, ?)",
+            (role, machine_id, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+
+
+def clear_swarm_machine(role: str):
+    """Remove a swarm machine assignment (call when machine enters terminal state)."""
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM swarm_machines WHERE role=?", (role,))
+        conn.commit()
+
+
+def list_swarm_machines() -> dict[str, str]:
+    """Return {role: machine_id} for all registered swarm machines."""
+    with _get_conn() as conn:
+        rows = conn.execute("SELECT role, machine_id FROM swarm_machines").fetchall()
+        return {r["role"]: r["machine_id"] for r in rows}
 
 
 # --- Incidents ---

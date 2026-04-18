@@ -97,7 +97,7 @@ async def run_incident_parser(run: AgentRun) -> dict:
         fema_context=_fmt_fema(fema),
     )
     run.log_entries.append("Calling LLM: situation_unit (incident_parser) with geocode + FEMA context")
-    return await call_llm(prompt)
+    return await call_llm(prompt, caller="incident_parser")
 
 
 async def run_risk_assessor(run: AgentRun) -> dict:
@@ -118,7 +118,7 @@ async def run_risk_assessor(run: AgentRun) -> dict:
         weather_escalation="; ".join(risk.get("escalation_triggers", ["None identified"])),
     )
     run.log_entries.append(f"Calling LLM: threat_analysis_unit with {len(alerts)} active NWS alert(s)")
-    return await call_llm(prompt)
+    return await call_llm(prompt, caller="risk_assessor")
 
 
 async def run_action_planner(run: AgentRun) -> dict:
@@ -142,7 +142,7 @@ async def run_action_planner(run: AgentRun) -> dict:
         hospital_context=_fmt_hospitals(hospitals),
     )
     run.log_entries.append("Calling LLM: operations_planner with ArcGIS routing + hospital context")
-    return await call_llm(prompt)
+    return await call_llm(prompt, caller="action_planner")
 
 
 def _fmt_triage(triage: list | None) -> str:
@@ -179,4 +179,4 @@ async def run_communications_agent(run: AgentRun) -> dict:
         route_summary=route_summary,
     )
     run.log_entries.append("Calling LLM: communications_officer with triage + weather + route context")
-    return await call_llm(prompt)
+    return await call_llm(prompt, caller="communications")
