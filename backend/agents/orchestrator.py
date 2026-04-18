@@ -1,22 +1,18 @@
 """
-Sentinel IAP Orchestrator — 3-phase parallel execution on persistent Dedalus swarm.
+Unilert IAP Orchestrator — multi-phase execution via DedalusRunner (no persistent machines).
 
-Swarm machine layout:
-  Situation Unit machine    → incident_parser
-  Intelligence machine      → risk_assessor (K2 Think V2) → action_planner (K2 Think V2)
-  Communications machine    → communications_agent
+Agents (each uses DedalusRunner.run when DEDALUS_API_KEY is set):
+  incident_parser → Situation Unit
+  risk_assessor   → Threat Analysis
+  action_planner  → Operations Planner
+  communications  → Communications Officer
 
 Execution flow:
   Phase 1 (parallel): Situation Unit + external context enrichment
-  Phase 2:            Intelligence machine — risk_assessor (K2 deep reasoning)
-  Phase 3 (parallel): Intelligence machine — action_planner (K2 routing + triage)
-                      Communications machine — communications_agent
+  Phase 2:            Threat Analysis (risk_assessor)
+  Phase 3:            Operations Planner, then Communications (triage + transport aware)
 
-K2 Think V2 is the core reasoning engine for the Intelligence machine (risk + planner).
-These are the two most analytically complex steps: threat escalation reasoning and
-routing-aware operational planning under triage constraints.
-
-Target total latency: ~45s (3 × ~15s LLM phases)
+Phase 3 runs Operations Planner first, then Communications.
 """
 from __future__ import annotations
 import asyncio
@@ -31,7 +27,7 @@ from models.plan import (
     PlanVersion, PlanDiff, ActionItem, CommunicationDraft, Assumption,
     MedicalImpact, TriagePriority, PatientTransport,
 )
-from models.agent import AgentRun, AgentType
+from models.agent import AgentRun, AgentType, AgentStatus
 from agents.specialist_agents import (
     run_incident_parser, run_risk_assessor, run_action_planner, run_communications_agent
 )
@@ -40,7 +36,7 @@ from agents.prompts import REPLAN_CONTEXT_PROMPT
 from services import gather_external_context
 from runtime import get_runtime
 from runtime.dedalus_runtime import AGENT_ROLE_MAP, ROLE_LABELS
-from db import save_agent_run, list_swarm_machines
+from db import save_agent_run
 
 
 def _make_run(incident: Incident, version: int, agent_type: AgentType, snapshot: dict) -> AgentRun:
@@ -96,16 +92,30 @@ def _parse_communications(comms_artifact: dict) -> list[CommunicationDraft]:
     return drafts
 
 
-def _parse_medical_impact(raw: dict | None) -> MedicalImpact | None:
-    if not raw or not isinstance(raw, dict):
+def _parse_medical_impact(raw: dict | None, parsed_fallback: dict | None = None) -> MedicalImpact | None:
+    if raw and isinstance(raw, dict) and any(
+        raw.get(k) not in (None, "", [], 0) for k in ("affected_population", "estimated_injured", "critical", "moderate", "minor", "at_risk_groups")
+    ):
+        return MedicalImpact(
+            affected_population=str(raw.get("affected_population", "")),
+            estimated_injured=str(raw.get("estimated_injured", "")),
+            critical=int(raw.get("critical", 0)),
+            moderate=int(raw.get("moderate", 0)),
+            minor=int(raw.get("minor", 0)),
+            at_risk_groups=list(raw.get("at_risk_groups", [])),
+        )
+    if not parsed_fallback:
+        return None
+    ap = str(parsed_fallback.get("affected_population", "") or "")
+    if not ap and not parsed_fallback.get("immediate_life_safety_threat"):
         return None
     return MedicalImpact(
-        affected_population=raw.get("affected_population", ""),
-        estimated_injured=raw.get("estimated_injured", ""),
-        critical=int(raw.get("critical", 0)),
-        moderate=int(raw.get("moderate", 0)),
-        minor=int(raw.get("minor", 0)),
-        at_risk_groups=raw.get("at_risk_groups", []),
+        affected_population=ap or "Estimate pending field verification",
+        estimated_injured="Unknown — confirm with EMS / triage lead",
+        critical=1 if parsed_fallback.get("immediate_life_safety_threat") else 0,
+        moderate=0,
+        minor=0,
+        at_risk_groups=[],
     )
 
 
@@ -115,11 +125,14 @@ def _parse_triage_priorities(raw: list | None) -> list[TriagePriority]:
     result = []
     for item in raw:
         if isinstance(item, dict):
+            rr = item.get("required_response") or item.get("required_action", "")
+            ra = item.get("required_action", "") or rr
             result.append(TriagePriority(
                 priority=int(item.get("priority", 1)),
                 label=item.get("label", ""),
                 estimated_count=int(item.get("estimated_count", 0)),
-                required_action=item.get("required_action", ""),
+                required_response=str(rr),
+                required_action=str(ra),
             ))
     return result
 
@@ -132,6 +145,7 @@ def _parse_patient_transport(raw: dict | None) -> PatientTransport | None:
         alternate_facilities=raw.get("alternate_facilities", []),
         transport_routes=raw.get("transport_routes", []),
         constraints=raw.get("constraints", []),
+        fallback_if_primary_unavailable=str(raw.get("fallback_if_primary_unavailable", "")),
     )
 
 
@@ -155,6 +169,16 @@ def _generate_diff(prev: PlanVersion, curr: PlanVersion) -> PlanDiff:
         changed_sections.append("ongoing_actions")
     if prev.assessed_severity != curr.assessed_severity:
         changed_sections.append("severity")
+    if (prev.medical_impact and curr.medical_impact and prev.medical_impact.model_dump() != curr.medical_impact.model_dump()) or (
+        (prev.medical_impact is None) != (curr.medical_impact is None)
+    ):
+        changed_sections.append("medical_impact")
+    if [t.model_dump() for t in prev.triage_priorities] != [t.model_dump() for t in curr.triage_priorities]:
+        changed_sections.append("triage_priorities")
+    if (prev.patient_transport and curr.patient_transport and prev.patient_transport.model_dump() != curr.patient_transport.model_dump()) or (
+        (prev.patient_transport is None) != (curr.patient_transport is None)
+    ):
+        changed_sections.append("patient_transport")
     return PlanDiff(
         from_version=prev.version,
         to_version=curr.version,
@@ -168,40 +192,25 @@ def _generate_diff(prev: PlanVersion, curr: PlanVersion) -> PlanDiff:
 
 
 def _print_swarm_truth(agent_runs: list[AgentRun], elapsed_ms: int) -> None:
-    """Print an unambiguous Dedalus swarm status block at end of each analyze."""
-    runtimes = {r.agent_type: r.runtime for r in agent_runs}
-    machines = {r.agent_type: r.machine_id for r in agent_runs if r.machine_id}
-    swarm = list_swarm_machines()  # role → machine_id from SQLite
-
-    # Artifact counts per run
-    def artifact_count(run: AgentRun) -> int:
-        return sum(1 for e in (run.log_entries or []) if "✓ Artifact" in e)
-
-    healthy = [r for r in agent_runs if r.runtime == "dedalus"]
-    degraded = [r for r in agent_runs if r.runtime == "dedalus_degraded"]
+    """Print DedalusRunner status at end of each analyze (no machine IDs)."""
+    dedalus = [r for r in agent_runs if r.runtime == "dedalus"]
     local = [r for r in agent_runs if r.runtime == "local"]
 
-    if len(healthy) == len(agent_runs):
-        status = f"HEALTHY — all {len(healthy)} agents on Dedalus machines ({elapsed_ms}ms)"
-    elif degraded or healthy:
-        status = f"PARTIAL — {len(healthy)} healthy / {len(degraded)} degraded / {len(local)} local ({elapsed_ms}ms)"
+    if len(dedalus) == len(agent_runs):
+        status = f"OK — all {len(dedalus)} agents via DedalusRunner ({elapsed_ms}ms)"
+    elif dedalus:
+        status = f"MIXED — {len(dedalus)} DedalusRunner / {len(local)} local K2 ({elapsed_ms}ms)"
     else:
-        status = f"FALLBACK — no Dedalus involvement ({elapsed_ms}ms)"
+        status = f"LOCAL — {len(local)} agents used K2 only ({elapsed_ms}ms)"
 
     print(f"\n{'─'*60}")
-    print(f"  Dedalus Swarm: {status}")
-    print(f"  Swarm machines registered:")
-    for role, mid in swarm.items():
-        print(f"    {ROLE_LABELS.get(role, role):<28} {mid[:12]} (role={role})")
-    if not swarm:
-        print("    (none)")
+    print(f"  Dedalus: {status}")
     print(f"  Per-agent:")
     for run in agent_runs:
         role = AGENT_ROLE_MAP.get(run.agent_type, "?")
-        mid = machines.get(run.agent_type, "none")[:12]
-        art = artifact_count(run)
-        k2 = " [K2 Think V2]" if role == "intelligence" else ""
-        print(f"    {run.agent_type:<22} runtime={run.runtime:<18} machine={mid}  artifacts={art}{k2}")
+        label = ROLE_LABELS.get(role, role)
+        ok = "✓" if run.status == AgentStatus.COMPLETED else "✗"
+        print(f"    {ok} {run.agent_type:<22} runtime={run.runtime:<10} {label}")
     print(f"{'─'*60}\n")
 
 
@@ -217,7 +226,7 @@ async def generate_plan(
     t_pipeline = time.monotonic()
 
     print(f"\n[{datetime.utcnow().strftime('%H:%M:%S')}] ═══ START ANALYZE incident={incident.id[:8]} v{version} ═══")
-    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Runtime: {runtime.runtime_name()} | Swarm machines: {list_swarm_machines()}")
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Runtime: {runtime.runtime_name()} (DedalusRunner when API key set)")
 
     full_report = incident.report if not update_text else f"{incident.report}\n\nFIELD UPDATE: {update_text}"
 
@@ -251,7 +260,7 @@ async def generate_plan(
     if run1.status.value == "failed":
         print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] incident_parser FAILED ({_elapsed(t1)}): {run1.error_message}")
     else:
-        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] PHASE 1 done ({_elapsed(t1)}) | parser={run1.runtime} machine={run1.machine_id[:12] if run1.machine_id else 'none'}")
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] PHASE 1 done ({_elapsed(t1)}) | parser={run1.runtime}")
 
     # ═══════════════════════════════════════════════════════════
     # PHASE 2
@@ -274,17 +283,13 @@ async def generate_plan(
     if run2.status.value == "failed":
         print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] risk_assessor FAILED ({_elapsed(t2)}): {run2.error_message}")
     else:
-        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] PHASE 2 done ({_elapsed(t2)}) | risk={run2.runtime} machine={run2.machine_id[:12] if run2.machine_id else 'none'}")
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] PHASE 2 done ({_elapsed(t2)}) | risk={run2.runtime}")
 
     # ═══════════════════════════════════════════════════════════
-    # PHASE 3 (parallel)
-    # Intelligence machine: action_planner (K2 Think V2)
-    #   — routing-aware ops planning, triage, patient transport
-    # Communications machine: communications_agent
-    #   — uses parsed situation + risk severity (not planner output)
-    #     to run in parallel; comms is formatting-heavy not logic-heavy
+    # PHASE 3 — Operations Planner then Communications (sequential)
+    # Planner produces triage + patient transport; comms drafts use that output.
     # ═══════════════════════════════════════════════════════════
-    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ── PHASE 3: Operations Planner (K2) + Communications (parallel) ──")
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ── PHASE 3a: Operations Planner — EMS + triage + transport ──")
     t3 = time.monotonic()
 
     run3 = _make_run(incident, version, AgentType.ACTION_PLANNER, {
@@ -294,42 +299,36 @@ async def generate_plan(
         "location": incident.location,
         "external_context": ext_ctx,
     })
+    run3 = await runtime.execute(run3, run_action_planner)
+    agent_runs.append(run3)
+    plan_raw = run3.output_artifact or {}
 
-    # Comms runs in parallel with planner on its own machine.
-    # It receives the parsed situation + risk severity rather than waiting
-    # for the planner's polished summary — acceptable for demo and real-world
-    # use where speed matters. Key facts (location, hazards, injuries) are
-    # all available from phase 1 + 2 outputs.
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ── PHASE 3b: Communications Officer — EMS / hospital / public ──")
     preliminary_summary = (
         f"{incident.incident_type} at {incident.location}. "
         f"Affected: {parsed.get('affected_population', 'unknown')}. "
-        + (f"Injuries: {parsed.get('medical_impact', {}).get('estimated_injured', 'unknown')}. " if parsed.get('medical_impact') else "")
+        + (f"Injuries: {parsed.get('medical_impact', {}).get('estimated_injured', 'unknown')}. " if parsed.get("medical_impact") else "")
         + f"Hazards: {', '.join(parsed.get('key_hazards', [])[:3])}."
     )
     run4 = _make_run(incident, version, AgentType.COMMUNICATIONS, {
-        "incident_summary": preliminary_summary,
+        "incident_summary": plan_raw.get("incident_summary") or preliminary_summary,
         "severity": risk.get("severity_level", "unknown"),
         "location": incident.location,
-        "priorities": risk.get("incident_objectives", []),
+        "priorities": plan_raw.get("operational_priorities") or risk.get("incident_objectives", []),
         "missing_info": parsed.get("unknowns", []),
-        "triage_priorities": [],  # planner not done yet; comms uses hazard context only
+        "triage_priorities": plan_raw.get("triage_priorities", []),
+        "patient_transport": plan_raw.get("patient_transport"),
         "external_context": ext_ctx,
     })
-
-    run3, run4 = await asyncio.gather(
-        runtime.execute(run3, run_action_planner),
-        runtime.execute(run4, run_communications_agent),
-    )
-    agent_runs.extend([run3, run4])
-    plan_raw = run3.output_artifact or {}
+    run4 = await runtime.execute(run4, run_communications_agent)
+    agent_runs.append(run4)
     comms = run4.output_artifact or {}
 
     for label, run in [("action_planner", run3), ("communications", run4)]:
         if run.status.value == "failed":
             print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {label} FAILED: {run.error_message}")
         else:
-            mid = run.machine_id[:12] if run.machine_id else "none"
-            print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {label} ok | runtime={run.runtime} machine={mid}")
+            print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {label} ok | runtime={run.runtime}")
 
     print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] PHASE 3 done ({_elapsed(t3)})")
 
@@ -389,9 +388,7 @@ async def generate_plan(
             {"name": h.get("name", ""), "distance_mi": h.get("distance_mi"), "trauma_level": h.get("trauma_level")}
             for h in hospitals[:4]
         ],
-        "swarm_machines": {
-            role: mid for role, mid in list_swarm_machines().items()
-        },
+        "dedalus_execution": "DedalusRunner" if runtime.runtime_name() == "dedalus" else "local",
     }
 
     plan = PlanVersion(
@@ -423,7 +420,7 @@ async def generate_plan(
         confidence_score=float(risk.get("confidence", 0.7)),
         risk_notes=risk.get("primary_risks", []),
 
-        medical_impact=_parse_medical_impact(parsed.get("medical_impact")),
+        medical_impact=_parse_medical_impact(parsed.get("medical_impact"), parsed),
         triage_priorities=_parse_triage_priorities(plan_raw.get("triage_priorities")),
         patient_transport=_parse_patient_transport(plan_raw.get("patient_transport")),
 

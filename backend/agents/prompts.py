@@ -36,7 +36,7 @@ Analyze the report and external context. Return a JSON object:
     "critical": estimated count of life-threatening injuries (integer),
     "moderate": estimated count of moderate injuries (integer),
     "minor": estimated count of minor injuries (integer),
-    "at_risk_groups": ["elderly", "children", "mobility-limited", etc. — only include if relevant]
+    "at_risk_groups": ["elderly", "children", "mobility-limited", "medically dependent" — only if relevant]
   }}
 }}
 
@@ -49,7 +49,7 @@ Language rules:
 
 RISK_ASSESSOR_PROMPT = """\
 You are the INTELLIGENCE/PLANNING SECTION for a regional multi-agency emergency coordination system.
-Your role in ICS: produce the Safety Message, risk assessment, and healthcare risk analysis for the IAP.
+Your role in ICS: produce Threat Analysis with emphasis on medical response, EMS access, and hospital coordination.
 
 Parsed Situation Status:
 {parsed_data}
@@ -70,39 +70,50 @@ Return a JSON object:
   "severity_level": "low|medium|high|critical",
   "confidence": 0.0 to 1.0,
   "incident_objectives": [
-    "LIFE SAFETY: [specific measurable goal — include patient stabilization if injuries present]",
-    "INCIDENT STABILIZATION: [specific measurable goal]",
-    "PROPERTY/INFRASTRUCTURE PROTECTION: [specific measurable goal]"
+    "LIFE SAFETY: [measurable — e.g. extricate and triage critical patients within X min]",
+    "MEDICAL / EMS: [measurable — e.g. establish triage, coordinate receiving hospitals]",
+    "SCENE / ACCESS: [measurable — e.g. secure corridors for ambulance ingress/egress]"
   ],
-  "primary_risks": ["specific risk — reference weather data, confirmed hazard, or medical risk if applicable"],
+  "primary_risks": [
+    "Healthcare: [delayed EMS access | exposure | respiratory compromise | crush injury progression — tie to situation]",
+    "Operational: [route, weather, or scene risk]",
+    "Capacity: [hospital or EMS surge risk if applicable]"
+  ],
   "safety_considerations": [
     "RESPONDER RISK: [specific hazard responders will face]",
-    "PPE REQUIRED: [specific equipment]",
-    "ENVIRONMENTAL: [weather, terrain, or exposure risk]"
+    "PPE REQUIRED: [specific equipment — include airway/skin protection if hazmat/exposure]",
+    "ENVIRONMENTAL: [weather, terrain, or toxic exposure risk]"
   ],
-  "escalation_triggers": ["concrete observable condition that elevates severity"],
+  "escalation_triggers": ["concrete observable condition that elevates severity — include medical deterioration if relevant"],
   "resource_adequacy": "sufficient|strained|insufficient",
-  "resource_gaps": ["missing capability or unit — include EMS gaps if injuries present"],
+  "resource_gaps": ["missing EMS, ALS, transport, decon, or hospital beds — be specific"],
   "estimated_duration_hours": number,
   "mutual_aid_needed": true or false,
   "weather_driven_threats": ["threat derived from NWS data — empty list if no active alerts"],
-  "replan_triggers": ["specific field condition requiring immediate IAP revision"],
+  "replan_triggers": [
+    "EMS response delay exceeds [X] minutes vs planned",
+    "Primary ambulance route or bridge becomes unusable or blocked",
+    "Estimated count of critical patients increases by [N] or field triage upgrades severity",
+    "Receiving facility reports diversion, saturation, or cannot accept patient category",
+    "Environmental or hazmat conditions worsen (wind shift, plume, flood surge)"
+  ],
   "healthcare_risks": [
-    "EMS delay → increased mortality if critical patients not transported within [X] min",
-    "Hospital capacity strain if [condition]",
-    "Injury deterioration risk due to [environmental condition]"
+    "Delayed EMS access: prolonged scene time increases mortality risk for critical patients",
+    "Transport delay: increased morbidity/mortality window for time-sensitive injuries",
+    "Hospital capacity strain: EMS backlog or diversion if receiving facilities saturated",
+    "Worsening exposure or environmental conditions: additional casualties or injury progression"
   ]
 }}
 
-Healthcare risk language rules:
-- Include EMS delay risk if injuries are confirmed or likely
-- Reference specific injury types from parsed_data.medical_impact
-- Include capacity strain if estimated_injured > 5
+Healthcare / threat rules:
+- primary_risks MUST include at least one healthcare-specific risk if medical_impact shows injuries OR immediate_life_safety_threat is true
+- replan_triggers MUST include the EMS delay, route unusable, critical count increase, and facility constraint patterns (use bracketed placeholders with numbers when unknown)
+- healthcare_risks: 3–4 items, formal operational tone, no vague language
 """
 
 ACTION_PLANNER_PROMPT = """\
-You are the OPERATIONS SECTION CHIEF for a regional multi-agency emergency coordination system.
-Your role in ICS: produce the Execution Plan, Resource Assignments, and Patient Transport Plan for the IAP.
+You are the OPERATIONS SECTION CHIEF for a regional multi-agency EMS and hospital coordination system.
+Your role in ICS: produce the Execution Plan, triage-driven priorities, and Patient Transport Plan tied to ArcGIS routing.
 
 Situation Status: {parsed_data}
 Intelligence/Risk Assessment: {risk_data}
@@ -124,86 +135,87 @@ Constraints:
 - Max 5 items per action phase
 - Max 4 sections in resource_assignments
 - Max 3 assumptions, max 4 missing_information items
-- All string values under 100 characters
-- Use action verbs: Dispatch, Establish, Deploy, Close, Redirect, Notify, Verify, Initiate, Secure, Triage, Transport
+- All string values under 120 characters
+- Use strong action verbs: Dispatch, Deploy, Establish, Stage, Triage, Transport, Reroute, Notify, Coordinate, Extricate, Stabilize, Decontaminate
 
-If injuries are present in the situation status, MUST include:
-- At least one EMS deployment action in immediate_actions
-- Triage zone establishment in short_term_actions
-- Hospital coordination in ongoing_actions
+Medical response requirements:
+- immediate_actions: MUST include Deploy EMS units and at least one action that addresses critical patients or access (e.g. prioritize extraction, clear corridor).
+- short_term_actions: MUST include Establish triage area / treatment sector OR equivalent.
+- ongoing_actions: MUST include Coordinate with receiving hospitals and Reroute transport if access changes (reference alternate route data).
 
 Return a JSON object:
 {{
-  "incident_summary": "2–3 sentence operational summary including injury count and triage status if applicable.",
+  "incident_summary": "2–3 sentences: who is injured, severity mix, EMS/hospital coordination status.",
   "operational_priorities": [
-    "1. [Ranked priority — action verb + outcome, e.g. 'Triage and transport critical patients']",
-    "2. [Ranked priority]",
-    "3. [Ranked priority]"
+    "1. [Verb + outcome — e.g. Deploy EMS and extricate Priority 1 patients]",
+    "2. [Verb + outcome]",
+    "3. [Verb + outcome]"
   ],
   "immediate_actions": [
-    {{"description": "action verb + specific task + location", "assigned_to": "ICS role or unit", "timeframe": "0–10 min"}}
+    {{"description": "verb + task + location/target", "assigned_to": "EMS / ICS role", "timeframe": "0–10 min"}}
   ],
   "short_term_actions": [
-    {{"description": "specific action", "assigned_to": "ICS role or unit", "timeframe": "10–30 min"}}
+    {{"description": "verb + task", "assigned_to": "unit", "timeframe": "10–30 min"}}
   ],
   "ongoing_actions": [
-    {{"description": "specific action", "assigned_to": "ICS role or unit", "timeframe": "30–120 min"}}
+    {{"description": "verb + task", "assigned_to": "unit", "timeframe": "30–120 min"}}
   ],
   "resource_assignments": {{
-    "operations": ["unit → task assignment"],
-    "logistics": ["unit → task assignment"],
-    "communications": ["unit → task assignment"],
-    "command": ["role → responsibility"]
+    "operations": ["EMS unit → task", "Engine/Rescue → task"],
+    "logistics": ["staging / equipment"],
+    "communications": ["hospital liaison / JIS"],
+    "command": ["Medical Branch / IC task"]
   }},
-  "primary_access_route": "recommended access route or null",
-  "alternate_access_route": "alternate if primary blocked or null",
+  "primary_access_route": "from ArcGIS primary route — short",
+  "alternate_access_route": "from ArcGIS alternate — short",
   "assumptions": [
-    {{"description": "specific operational assumption", "impact": "consequence if wrong", "confidence": 0.0–1.0}}
+    {{"description": "operational assumption", "impact": "if wrong", "confidence": 0.0–1.0}}
   ],
-  "missing_information": ["critical unknown that affects operations"],
+  "missing_information": ["unknown that changes triage or transport"],
   "triage_priorities": [
-    {{"priority": 1, "label": "critical", "estimated_count": integer, "required_action": "immediate transport to trauma center"}},
-    {{"priority": 2, "label": "urgent", "estimated_count": integer, "required_action": "on-site stabilization then transport"}},
-    {{"priority": 3, "label": "minor", "estimated_count": integer, "required_action": "on-site monitoring and self-care"}}
+    {{"priority": 1, "label": "critical / life-threatening", "estimated_count": integer, "required_response": "immediate transport", "required_action": "one line: destination type + EMS resource"}},
+    {{"priority": 2, "label": "urgent but stable", "estimated_count": integer, "required_response": "on-site stabilization", "required_action": "stabilize then transport"}},
+    {{"priority": 3, "label": "minor / delayed", "estimated_count": integer, "required_response": "monitoring / delayed transport", "required_action": "hold for evaluation or self-care"}}
   ],
   "patient_transport": {{
-    "primary_facilities": ["hospital name + distance/ETA if known"],
-    "alternate_facilities": ["alternate hospital name"],
-    "transport_routes": ["route description from scene to primary facility"],
-    "constraints": ["blocked road, bridge weight limit, or other transport impediment"]
+    "primary_facilities": ["receiving facility + role e.g. trauma — from hospital context"],
+    "alternate_facilities": ["backup if primary saturated"],
+    "transport_routes": ["scene → facility using primary ArcGIS corridor; name roads if in route data"],
+    "constraints": ["flooding, closure, weight limit, hazmat corridor — tie to situation"],
+    "fallback_if_primary_unavailable": "explicit reroute using alternate_access_route or next-nearest facility"
   }}
 }}
 
 Triage rules:
-- estimated_counts must sum to approximately the injured estimate from parsed_data.medical_impact
-- If no injuries: set all counts to 0, keep patient_transport with nearest facilities as contingency
-- primary_facilities must reference hospital_context if available
+- Sum of estimated_count across priorities ≈ injured total from parsed_data.medical_impact (or 0 if none).
+- If no injuries: triage counts 0; still list nearest receiving facilities as contingency.
+- patient_transport.transport_routes and fallback MUST reflect primary vs alternate routing context above.
 """
 
 COMMUNICATIONS_PROMPT = """\
-You are the PUBLIC INFORMATION OFFICER (PIO) for a regional multi-agency emergency coordination system.
-Your role in ICS: produce the Communications Plan including EMS brief, hospital notification, and public health advisory.
+You are the COMMUNICATIONS UNIT for EMS, hospital coordination, and public safety messaging.
 
 Operational Summary: {incident_summary}
 Severity: {severity}
 Location: {location}
 Operational Priorities: {priorities}
 Missing Information: {missing_info}
-Triage Status: {triage_summary}
+Triage Summary: {triage_summary}
+Patient Transport Plan: {transport_summary}
 
 --- LIVE CONDITIONS ---
 Active Weather Alerts: {weather_alerts_summary}
 Current Conditions: {conditions_summary}
-Primary Access Route: {route_summary}
+Primary Access / Routing: {route_summary}
 -----------------------
 
-Draft four messages. Each must reference specific location, conditions, and actions — no generic language.
+Draft four messages. Each must reference location, triage/transport facts, and concrete instructions — no generic language.
 
 Rules:
-- EMS brief: tactical. Triage zone locations, patient counts by priority, transport destinations. Under 100 words.
-- Hospital notification: clinical. Incoming patient count, injury types, ETA. Under 80 words.
-- Public advisory: calm, factual. Where to seek care, what to avoid, specific instructions.
-- Leadership update: situational awareness, resource status, next decision point requiring authorization.
+- ems_brief: tactical EMS responder brief. Triage sector location, patient counts by priority, receiving facilities, route cautions. Under 100 words. Formal ICS tone.
+- hospital_notification: notify receiving hospitals. Incoming patient categories, mechanism/exposure if relevant, ETA window, contact point. Under 80 words.
+- public_advisory: public health / public safety. Avoid EMS corridors if needed, shelter-in-place or evacuation per scenario, where to seek care, what not to do. 80–100 words.
+- administration_update: leadership. Status, EMS/hospital coordination, one explicit decision or authorization point.
 
 Return a JSON object:
 {{

@@ -27,6 +27,7 @@ export interface TriagePriority {
   priority: number;
   label: string;
   estimated_count: number;
+  required_response?: string;
   required_action: string;
 }
 
@@ -35,6 +36,7 @@ export interface PatientTransport {
   alternate_facilities: string[];
   transport_routes: string[];
   constraints: string[];
+  fallback_if_primary_unavailable?: string;
 }
 
 export type SeverityLevel = "low" | "medium" | "high" | "critical";
@@ -165,6 +167,7 @@ export interface PlanVersion {
     alternate_access_route?: string | null;
     healthcare_risks?: string[];
     hospitals?: { name: string; distance_mi?: number | null; trauma_level?: string | null }[];
+    dedalus_execution?: string;
   };
 }
 

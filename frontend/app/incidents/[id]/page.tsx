@@ -98,17 +98,10 @@ function IncidentObjectives({ objectives }: { objectives: string[] }) {
   );
 }
 
-function OperationalPriorities({ priorities, weatherThreats, replanTriggers }: {
-  priorities: string[];
-  weatherThreats: string[];
-  replanTriggers: string[];
-}) {
-  const [expanded, setExpanded] = useState(false);
-
+function OperationalPriorities({ priorities }: { priorities: string[] }) {
   return (
     <div className="space-y-2">
       {priorities.map((p, i) => {
-        // Strip leading rank if LLM included "1. ..."
         const text = p.replace(/^\d+\.\s*/, "");
         return (
           <div key={i} className="flex gap-2.5 text-xs items-start">
@@ -121,32 +114,9 @@ function OperationalPriorities({ priorities, weatherThreats, replanTriggers }: {
           </div>
         );
       })}
-
-      {(weatherThreats.length > 0 || replanTriggers.length > 0) && (
-        <>
-          <button
-            onClick={() => setExpanded((e) => !e)}
-            className="text-[11px] text-muted-foreground hover:text-foreground transition-colors ml-7"
-          >
-            {expanded ? "Show less" : "View escalation triggers"}
-          </button>
-          {expanded && (
-            <div className="ml-7 space-y-2 pt-1">
-              {weatherThreats.map((t, i) => (
-                <div key={i} className="flex gap-2 text-xs">
-                  <span className="text-orange-400/70 shrink-0">NWS</span>
-                  <span className="text-orange-300/80">{t}</span>
-                </div>
-              ))}
-              {replanTriggers.slice(0, 3).map((t, i) => (
-                <div key={i} className="text-[11px] text-amber-400/60">
-                  Replan if: {t}
-                </div>
-              ))}
-            </div>
-          )}
-        </>
-      )}
+      <p className="text-[10px] text-muted-foreground/70 ml-7 pt-1">
+        Escalation and replan triggers are listed under Threat Analysis above.
+      </p>
     </div>
   );
 }
@@ -345,7 +315,11 @@ function CommsSummary({ plan }: { plan: PlanVersion }) {
   if (!comms.length) return <p className="text-xs text-muted-foreground">No communications drafted.</p>;
 
   const audienceMap: Record<string, string> = {
-    responders: "Responders",
+    "ems responders": "EMS",
+    ems: "EMS",
+    responders: "EMS",
+    "receiving hospitals": "Hospitals",
+    hospital: "Hospitals",
     "campus community": "Public",
     public: "Public",
     administration: "Leadership",
@@ -428,18 +402,18 @@ function DiffSummary({ diff }: { diff: PlanDiff }) {
   );
 }
 
-function MedicalImpactPanel({ impact, healthcareRisks }: { impact: MedicalImpact; healthcareRisks?: string[] }) {
+function MedicalImpactPanel({ impact }: { impact: MedicalImpact }) {
   const total = impact.critical + impact.moderate + impact.minor;
   const hasCounts = total > 0;
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest mb-0.5">Affected Population</p>
+          <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest mb-0.5">Estimated Affected Population</p>
           <p className="text-xs text-foreground/90">{impact.affected_population || "—"}</p>
         </div>
         <div>
-          <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest mb-0.5">Estimated Injured</p>
+          <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest mb-0.5">Estimated Injured (range)</p>
           <p className="text-xs text-foreground/90">{impact.estimated_injured || "—"}</p>
         </div>
       </div>
@@ -474,18 +448,72 @@ function MedicalImpactPanel({ impact, healthcareRisks }: { impact: MedicalImpact
           </div>
         </div>
       )}
+    </div>
+  );
+}
 
-      {healthcareRisks && healthcareRisks.length > 0 && (
+function ThreatAnalysisPanel({
+  primaryRisks,
+  healthcareRisks,
+  replanTriggers,
+  weatherThreats,
+}: {
+  primaryRisks: string[];
+  healthcareRisks: string[];
+  replanTriggers: string[];
+  weatherThreats: string[];
+}) {
+  const hasAny =
+    primaryRisks.length > 0 ||
+    healthcareRisks.length > 0 ||
+    replanTriggers.length > 0 ||
+    weatherThreats.length > 0;
+  if (!hasAny) {
+    return <p className="text-xs text-muted-foreground">No threat analysis data.</p>;
+  }
+  return (
+    <div className="space-y-3 text-xs">
+      {primaryRisks.length > 0 && (
         <div>
-          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1">Healthcare Risks</p>
-          <div className="space-y-1">
-            {healthcareRisks.map((r, i) => (
-              <div key={i} className="flex gap-2 text-xs items-start">
-                <span className="text-red-400/60 shrink-0 mt-0.5">!</span>
-                <span className="text-foreground/80">{r}</span>
-              </div>
+          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Priority Risks</p>
+          <ul className="space-y-1">
+            {primaryRisks.map((r, i) => (
+              <li key={i} className="flex gap-2 text-foreground/85">
+                <span className="text-orange-400/80 shrink-0">•</span>
+                <span>{r}</span>
+              </li>
             ))}
-          </div>
+          </ul>
+        </div>
+      )}
+      {healthcareRisks.length > 0 && (
+        <div>
+          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Healthcare / EMS Risks</p>
+          <ul className="space-y-1">
+            {healthcareRisks.map((r, i) => (
+              <li key={i} className="flex gap-2 text-foreground/85">
+                <span className="text-red-400/70 shrink-0">+</span>
+                <span>{r}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {(weatherThreats.length > 0 || replanTriggers.length > 0) && (
+        <div>
+          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Replan & Escalation</p>
+          {weatherThreats.map((t, i) => (
+            <div key={`w-${i}`} className="flex gap-2 text-[11px] text-orange-300/90 mb-1">
+              <span className="shrink-0">NWS</span>
+              <span>{t}</span>
+            </div>
+          ))}
+          {replanTriggers.slice(0, 6).map((t, i) => (
+            <div key={i} className="flex gap-2 text-[11px] text-amber-400/80 mt-0.5">
+              <span className="shrink-0">Replan if</span>
+              <span>{t}</span>
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -498,23 +526,40 @@ const TRIAGE_COLORS: Record<number, { bg: string; text: string; border: string; 
   3: { bg: "bg-yellow-500/8", text: "text-yellow-400", border: "border-yellow-500/25", dot: "bg-yellow-500" },
 };
 
+const RESPONSE_LABELS: Record<string, string> = {
+  immediate_transport: "Immediate transport",
+  "on-site stabilization": "On-site stabilization",
+  on_site_stabilization: "On-site stabilization",
+  "monitoring / delayed transport": "Monitoring / delayed transport",
+  monitoring_delayed_transport: "Monitoring / delayed transport",
+};
+
 function TriagePrioritiesPanel({ priorities }: { priorities: TriagePriority[] }) {
   if (!priorities.length) return <p className="text-xs text-muted-foreground">No triage data.</p>;
   return (
     <div className="space-y-2">
       {priorities.map((t) => {
         const c = TRIAGE_COLORS[t.priority] ?? TRIAGE_COLORS[3];
+        const rr = t.required_response?.trim();
+        const responseDisplay = rr
+          ? RESPONSE_LABELS[rr] ?? rr.replace(/_/g, " ")
+          : null;
         return (
           <div key={t.priority} className={`p-3 rounded border ${c.border} ${c.bg}`}>
-            <div className="flex items-center gap-2 mb-1.5">
+            <div className="flex items-center gap-2 mb-1.5 flex-wrap">
               <span className={`w-2 h-2 rounded-full shrink-0 ${c.dot}`} />
               <span className={`text-[10px] font-bold uppercase tracking-widest ${c.text}`}>
-                Priority {t.priority} — {t.label}
+                Priority {t.priority}: {t.label}
               </span>
               <span className={`ml-auto text-sm font-bold ${c.text}`}>{t.estimated_count}</span>
-              <span className={`text-[10px] ${c.text} opacity-70`}>patients</span>
+              <span className={`text-[10px] ${c.text} opacity-70`}>est. patients</span>
             </div>
-            <p className="text-xs text-foreground/75 ml-4">{t.required_action}</p>
+            {responseDisplay && (
+              <p className={`text-[10px] font-semibold uppercase tracking-wide ${c.text} opacity-90 mb-1 ml-4`}>
+                Required response: {responseDisplay}
+              </p>
+            )}
+            <p className="text-xs text-foreground/75 ml-4">{t.required_action || t.required_response}</p>
           </div>
         );
       })}
@@ -522,17 +567,28 @@ function TriagePrioritiesPanel({ priorities }: { priorities: TriagePriority[] })
   );
 }
 
-function PatientTransportPanel({ transport, hospitals }: {
-  transport: PatientTransport;
+function PatientTransportPanel({ transport, hospitals, primaryRoute, alternateRoute }: {
+  transport: PatientTransport | null;
   hospitals?: { name: string; distance_mi?: number | null; trauma_level?: string | null }[];
+  primaryRoute?: string | null;
+  alternateRoute?: string | null;
 }) {
+  const t = transport ?? {
+    primary_facilities: [] as string[],
+    alternate_facilities: [] as string[],
+    transport_routes: [] as string[],
+    constraints: [] as string[],
+    fallback_if_primary_unavailable: "",
+  };
+  const showArcgisRoutes = primaryRoute || alternateRoute;
+
   return (
     <div className="space-y-4">
-      {transport.primary_facilities.length > 0 && (
+      {t.primary_facilities.length > 0 && (
         <div>
           <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Primary Receiving Facilities</p>
           <div className="space-y-1">
-            {transport.primary_facilities.map((f, i) => (
+            {t.primary_facilities.map((f, i) => (
               <div key={i} className="flex gap-2 text-xs items-start">
                 <span className="text-green-400/70 shrink-0">+</span>
                 <span className="text-foreground/90">{f}</span>
@@ -542,11 +598,11 @@ function PatientTransportPanel({ transport, hospitals }: {
         </div>
       )}
 
-      {transport.alternate_facilities.length > 0 && (
+      {t.alternate_facilities.length > 0 && (
         <div>
-          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Alternate Facilities</p>
+          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Alternate Receiving Facilities</p>
           <div className="space-y-1">
-            {transport.alternate_facilities.map((f, i) => (
+            {t.alternate_facilities.map((f, i) => (
               <div key={i} className="flex gap-2 text-xs items-start">
                 <span className="text-muted-foreground/50 shrink-0">○</span>
                 <span className="text-foreground/75">{f}</span>
@@ -556,11 +612,11 @@ function PatientTransportPanel({ transport, hospitals }: {
         </div>
       )}
 
-      {transport.transport_routes.length > 0 && (
+      {t.transport_routes.length > 0 && (
         <div>
-          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Transport Routes</p>
+          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Recommended Transport Routes</p>
           <div className="space-y-1">
-            {transport.transport_routes.map((r, i) => (
+            {t.transport_routes.map((r, i) => (
               <div key={i} className="flex gap-2 text-xs items-start">
                 <span className="text-blue-400/60 shrink-0">→</span>
                 <span className="text-foreground/80">{r}</span>
@@ -570,17 +626,44 @@ function PatientTransportPanel({ transport, hospitals }: {
         </div>
       )}
 
-      {transport.constraints.length > 0 && (
+      {showArcgisRoutes && (
         <div>
-          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Transport Constraints</p>
+          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">ArcGIS Route Reference</p>
+          {primaryRoute && (
+            <div className="flex gap-2 text-xs text-foreground/80 mb-1">
+              <span className="text-blue-400/60 shrink-0">P</span>
+              <span>{primaryRoute}</span>
+            </div>
+          )}
+          {alternateRoute && (
+            <div className="flex gap-2 text-xs text-muted-foreground/90">
+              <span className="text-muted-foreground/50 shrink-0">A</span>
+              <span>Alternate: {alternateRoute}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {t.constraints.length > 0 && (
+        <div>
+          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest mb-1.5">Route Constraints</p>
           <div className="space-y-1">
-            {transport.constraints.map((c, i) => (
+            {t.constraints.map((c, i) => (
               <div key={i} className="flex gap-2 text-xs items-start">
                 <span className="text-orange-400/70 shrink-0">⚠</span>
                 <span className="text-foreground/80">{c}</span>
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {(t.fallback_if_primary_unavailable || alternateRoute) && (
+        <div className="p-2.5 rounded border border-cyan-500/20 bg-cyan-500/5">
+          <p className="text-[10px] font-bold text-cyan-400/90 uppercase tracking-widest mb-1">Fallback if Primary Route Unavailable</p>
+          <p className="text-xs text-foreground/85">
+            {t.fallback_if_primary_unavailable || alternateRoute || "Use alternate ArcGIS corridor and notify EMS command."}
+          </p>
         </div>
       )}
 
@@ -725,28 +808,64 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
         {/* IAP Section 1 — Incident Overview */}
         <IncidentOverview incident={incident} plan={displayPlan ?? null} alertCount={alertCount} />
 
-        {/* Medical Impact — always visible when present */}
+        {/* Medical Impact */}
         {displayPlan?.medical_impact && (
           <div className="space-y-2">
             <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
               Medical Impact
             </p>
             <div className="p-4 rounded-lg border border-red-500/20 bg-red-500/5">
-              <MedicalImpactPanel
-                impact={displayPlan.medical_impact}
-                healthcareRisks={ext?.healthcare_risks}
+              <MedicalImpactPanel impact={displayPlan.medical_impact} />
+            </div>
+          </div>
+        )}
+
+        {/* Triage Priorities */}
+        {displayPlan?.triage_priorities && displayPlan.triage_priorities.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
+              Triage Priorities
+            </p>
+            <TriagePrioritiesPanel priorities={displayPlan.triage_priorities} />
+          </div>
+        )}
+
+        {/* Patient Transport Plan — ArcGIS + planner (updates on replan) */}
+        {displayPlan &&
+          (displayPlan.patient_transport != null || (ext?.hospitals && ext.hospitals.length > 0)) && (
+          <div className="space-y-2">
+            <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
+              Patient Transport Plan
+            </p>
+            <div className="p-4 rounded-lg border border-blue-500/20 bg-blue-500/5">
+              <PatientTransportPanel
+                transport={displayPlan.patient_transport ?? null}
+                hospitals={ext?.hospitals}
+                primaryRoute={ext?.primary_access_route ?? undefined}
+                alternateRoute={ext?.alternate_access_route ?? undefined}
               />
             </div>
           </div>
         )}
 
-        {/* Triage Priorities — always visible when present */}
-        {displayPlan?.triage_priorities && displayPlan.triage_priorities.length > 0 && (
+        {/* Threat Analysis (healthcare-aware) */}
+        {displayPlan &&
+          (displayPlan.risk_notes.length > 0 ||
+            (ext?.healthcare_risks && ext.healthcare_risks.length > 0) ||
+            (ext?.replan_triggers && ext.replan_triggers.length > 0) ||
+            (ext?.weather_driven_threats && ext.weather_driven_threats.length > 0)) && (
           <div className="space-y-2">
             <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
-              Medical Triage Priorities
+              Threat Analysis
             </p>
-            <TriagePrioritiesPanel priorities={displayPlan.triage_priorities} />
+            <div className="p-4 rounded-lg border border-orange-500/20 bg-orange-500/5">
+              <ThreatAnalysisPanel
+                primaryRisks={displayPlan.risk_notes}
+                healthcareRisks={ext?.healthcare_risks ?? []}
+                replanTriggers={ext?.replan_triggers ?? []}
+                weatherThreats={ext?.weather_driven_threats ?? []}
+              />
+            </div>
           </div>
         )}
 
@@ -816,11 +935,7 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
                   : undefined
               }
             >
-              <OperationalPriorities
-                priorities={displayPlan.operational_priorities}
-                weatherThreats={ext?.weather_driven_threats ?? []}
-                replanTriggers={ext?.replan_triggers ?? []}
-              />
+              <OperationalPriorities priorities={displayPlan.operational_priorities} />
             </Accordion>
 
             {/* Section 4 — Full Execution Plan */}
@@ -835,16 +950,6 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
                 roleAssignments={displayPlan.role_assignments}
               />
             </Accordion>
-
-            {/* Patient Transport Plan */}
-            {displayPlan.patient_transport && (
-              <Accordion title="Patient Transport Plan" defaultOpen={true}>
-                <PatientTransportPanel
-                  transport={displayPlan.patient_transport}
-                  hospitals={ext?.hospitals}
-                />
-              </Accordion>
-            )}
 
             {/* Section 6 — Safety */}
             {displayPlan.safety_considerations.length > 0 && (
@@ -929,7 +1034,7 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
 
       <footer className="border-t border-border max-w-2xl mx-auto w-full px-5 py-2">
         <p className="text-[10px] text-muted-foreground/50 text-center">
-          Unilert · Decision-support tool · All outputs require human review before action
+          Unilert · EMS & hospital coordination decision-support · Human review required before action
         </p>
       </footer>
     </div>

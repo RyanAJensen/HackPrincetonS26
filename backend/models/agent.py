@@ -28,7 +28,7 @@ class AgentRun(BaseModel):
     status: AgentStatus = AgentStatus.PENDING
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-    runtime: str = "local"  # "local" | "dedalus"
+    runtime: str = "local"  # "local" (K2) | "dedalus" (DedalusRunner)
     machine_id: Optional[str] = None  # Dedalus machine ID if applicable
     input_snapshot: Optional[dict] = None
     output_artifact: Optional[dict] = None

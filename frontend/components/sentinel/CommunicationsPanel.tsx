@@ -12,12 +12,40 @@ const AUDIENCE_CONFIG: Record<string, {
   urgencyColor: string;
   icon: string;
 }> = {
-  responders: {
-    tab: "Responders",
-    label: "Responder Brief",
-    sublabel: "Field personnel and first responders",
+  "ems responders": {
+    tab: "EMS",
+    label: "EMS Responder Brief",
+    sublabel: "Triage, transport, and receiving-facility coordination",
     urgencyColor: "bg-red-500/20 text-red-400 border-red-500/30",
     icon: "🚨",
+  },
+  ems: {
+    tab: "EMS",
+    label: "EMS Responder Brief",
+    sublabel: "Triage, transport, and receiving-facility coordination",
+    urgencyColor: "bg-red-500/20 text-red-400 border-red-500/30",
+    icon: "🚨",
+  },
+  responders: {
+    tab: "EMS",
+    label: "EMS / Responder Brief",
+    sublabel: "Field EMS and first responders",
+    urgencyColor: "bg-red-500/20 text-red-400 border-red-500/30",
+    icon: "🚨",
+  },
+  "receiving hospitals": {
+    tab: "Hospitals",
+    label: "Hospital Notification",
+    sublabel: "Receiving facilities — incoming patients and ETA",
+    urgencyColor: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
+    icon: "🏥",
+  },
+  hospital: {
+    tab: "Hospitals",
+    label: "Hospital Notification",
+    sublabel: "Receiving facilities — incoming patients and ETA",
+    urgencyColor: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
+    icon: "🏥",
   },
   "campus community": {
     tab: "Public",
@@ -43,9 +71,8 @@ const AUDIENCE_CONFIG: Record<string, {
 };
 
 function getConfig(draft: CommunicationDraft) {
-  const key = Object.keys(AUDIENCE_CONFIG).find((k) =>
-    draft.audience.toLowerCase().includes(k.toLowerCase())
-  );
+  const keys = Object.keys(AUDIENCE_CONFIG).sort((a, b) => b.length - a.length);
+  const key = keys.find((k) => draft.audience.toLowerCase().includes(k.toLowerCase()));
   return key ? AUDIENCE_CONFIG[key] : {
     tab: draft.audience,
     label: draft.audience,
@@ -93,8 +120,8 @@ function CommCard({ draft }: { draft: CommunicationDraft }) {
   );
 }
 
-// Determine preferred display order: responders → public → leadership
-const PRIORITY_ORDER = ["responders", "public", "campus community", "administration"];
+// Preferred display order: EMS → hospitals → public → leadership
+const PRIORITY_ORDER = ["ems responders", "ems", "responders", "receiving hospitals", "hospital", "public", "campus community", "administration"];
 
 function sortDrafts(drafts: CommunicationDraft[]): CommunicationDraft[] {
   return [...drafts].sort((a, b) => {

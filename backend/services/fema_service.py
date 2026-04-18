@@ -17,7 +17,7 @@ async def get_nj_hazard_context() -> dict:
     Focus on declared disaster types that match known campus risk categories.
     """
     try:
-        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Sentinel/1.0"}) as client:
+        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Unilert/1.0"}) as client:
             r = await client.get(FEMA_API, params={
                 "state": "NJ",
                 "limit": 10,

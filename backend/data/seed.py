@@ -25,8 +25,8 @@ CAMPUS_RESOURCES: list[Resource] = [
 DEMO_SCENARIOS: list[dict] = [
     {
         "id": "demo-flood",
-        "label": "Flash Flood with Trapped Patients — Washington Road",
-        "sub": "Rising water, 4 patients trapped, EMS access blocked, critical transport window closing",
+        "label": "Flash Flood with Injuries",
+        "sub": "Stranded vehicles, injured civilians, delayed EMS access — Washington Road corridor",
         "incident": IncidentCreate(
             incident_type="Flash Flood / Mass Casualty",
             report=(
@@ -48,8 +48,8 @@ DEMO_SCENARIOS: list[dict] = [
     },
     {
         "id": "demo-hazmat",
-        "label": "Hazardous Material Exposure — Nassau Street Research Facility",
-        "sub": "Chlorine gas release, respiratory casualties, decontamination triage required",
+        "label": "Hazmat Exposure Event",
+        "sub": "Respiratory distress risk, decontamination and hospital coordination",
         "incident": IncidentCreate(
             incident_type="Hazardous Materials Exposure / Mass Casualty",
             report=(
@@ -72,8 +72,8 @@ DEMO_SCENARIOS: list[dict] = [
     },
     {
         "id": "demo-storm",
-        "label": "Severe Storm — Multi-Trauma Mass Casualty",
-        "sub": "Building collapse, 8+ injuries, critical patients, blocked transport routes",
+        "label": "Severe Storm with Multiple Casualties",
+        "sub": "Structural damage, multiple injury severities, transport route disruption",
         "incident": IncidentCreate(
             incident_type="Severe Weather / Mass Casualty Incident",
             report=(

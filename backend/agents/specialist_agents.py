@@ -151,8 +151,29 @@ def _fmt_triage(triage: list | None) -> str:
     parts = []
     for t in triage:
         if isinstance(t, dict):
-            parts.append(f"P{t.get('priority', '?')} {t.get('label', '')}: {t.get('estimated_count', 0)} patients — {t.get('required_action', '')}")
+            rr = t.get("required_response") or t.get("required_action", "")
+            parts.append(
+                f"P{t.get('priority', '?')} ({t.get('label', '')}): {t.get('estimated_count', 0)} pts — "
+                f"response: {rr}"
+            )
     return "; ".join(parts) if parts else "No triage data"
+
+
+def _fmt_patient_transport(pt: dict | None) -> str:
+    if not pt or not isinstance(pt, dict):
+        return "Transport plan pending planner output"
+    bits = []
+    if pt.get("primary_facilities"):
+        bits.append("Primary receiving: " + "; ".join(pt["primary_facilities"][:3]))
+    if pt.get("alternate_facilities"):
+        bits.append("Alternate: " + "; ".join(pt["alternate_facilities"][:2]))
+    if pt.get("transport_routes"):
+        bits.append("Routes: " + "; ".join(pt["transport_routes"][:2]))
+    if pt.get("constraints"):
+        bits.append("Constraints: " + "; ".join(pt["constraints"][:3]))
+    if pt.get("fallback_if_primary_unavailable"):
+        bits.append("Fallback: " + str(pt["fallback_if_primary_unavailable"])[:200])
+    return " | ".join(bits) if bits else "No structured transport data"
 
 
 async def run_communications_agent(run: AgentRun) -> dict:
@@ -174,6 +195,7 @@ async def run_communications_agent(run: AgentRun) -> dict:
         priorities=json.dumps(inp["priorities"]),
         missing_info=json.dumps(inp.get("missing_info", [])),
         triage_summary=_fmt_triage(inp.get("triage_priorities")),
+        transport_summary=_fmt_patient_transport(inp.get("patient_transport")),
         weather_alerts_summary=alerts_summary,
         conditions_summary=conditions_summary,
         route_summary=route_summary,

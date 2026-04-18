@@ -1,4 +1,4 @@
-# Sentinel — Campus Incident Response Copilot
+# Unilert — Campus Incident Response Copilot
 
 Adaptive AI-powered decision-support tool for campus emergency response.  
 Built with Next.js, FastAPI, Claude, and Dedalus Machines.
@@ -59,7 +59,7 @@ sentinel/
 ```
 ANTHROPIC_API_KEY=sk-ant-...     # Required
 DEDALUS_API_KEY=                 # Optional — falls back to local runtime
-DEDALUS_PROJECT_ID=sentinel
+DEDALUS_PROJECT_ID=unilert
 RUNTIME_MODE=dedalus             # "dedalus" | "local"
 ```
 
@@ -71,14 +71,23 @@ NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
 ### Running
 
 **Backend:**
+
+Create the venv and install deps, then **always start the API with the venv interpreter** (`venv\Scripts\python.exe` on Windows, `venv/bin/python` on Mac/Linux). Do **not** run a globally installed `uvicorn` from PATH unless that `uvicorn` belongs to the same interpreter; reload subprocesses inherit `sys.executable`, and the Dedalus startup checks read the same environment as `dedalus_labs`.
+
 ```bash
 cd backend
 python -m venv venv
 venv/Scripts/pip install -r requirements.txt   # Windows
 # or: venv/bin/pip install -r requirements.txt  # Mac/Linux
 
-# Set ANTHROPIC_API_KEY in .env, then:
-venv/Scripts/python -m uvicorn main:app --reload --port 8000
+# Set ANTHROPIC_API_KEY in .env, then (Windows cmd/PowerShell/Git Bash):
+venv/Scripts/python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Windows shortcuts (from `backend/`): `start.cmd` or `.\start.ps1` (both call `venv\Scripts\python.exe -m uvicorn ...`). Git Bash:
+
+```bash
+cd backend && ./venv/Scripts/python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 **Frontend:**

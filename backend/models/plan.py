@@ -16,9 +16,10 @@ class MedicalImpact(BaseModel):
 
 class TriagePriority(BaseModel):
     priority: int                      # 1, 2, or 3
-    label: str                         # "critical", "urgent", "minor"
+    label: str                         # e.g. "critical / life-threatening"
     estimated_count: int = 0
-    required_action: str = ""
+    required_response: str = ""       # immediate transport | on-site stabilization | monitoring / delayed transport
+    required_action: str = ""         # operational detail (kept for API compat)
 
 
 class PatientTransport(BaseModel):
@@ -26,6 +27,7 @@ class PatientTransport(BaseModel):
     alternate_facilities: list[str] = Field(default_factory=list)
     transport_routes: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
+    fallback_if_primary_unavailable: str = ""  # ArcGIS alternate / manual routing
 
 
 class ActionItem(BaseModel):

@@ -10,23 +10,23 @@ const UNIT_LABELS: Record<string, string> = {
 };
 
 const UNIT_VERBS: Record<string, string> = {
-  incident_parser: "situation assessed",
-  risk_assessor:   "threats identified",
-  action_planner:  "plan generated",
-  communications:  "messages drafted",
+  incident_parser: "medical impact estimated",
+  risk_assessor:   "healthcare risks analyzed",
+  action_planner:  "EMS & transport plan ready",
+  communications:  "EMS / hospital comms drafted",
 };
 
 const RUNTIME_BADGE: Record<string, { label: string; classes: string }> = {
   dedalus: {
-    label: "Dedalus",
+    label: "DedalusRunner",
     classes: "text-cyan-400 border-cyan-500/30 bg-cyan-500/8",
   },
   dedalus_degraded: {
-    label: "Dedalus (degraded)",
+    label: "Dedalus (legacy)",
     classes: "text-orange-400 border-orange-500/30 bg-orange-500/8",
   },
   local: {
-    label: "Local",
+    label: "Local K2",
     classes: "text-muted-foreground/60 border-border",
   },
 };
@@ -68,7 +68,6 @@ export function SystemActivity({ runs, isLoading }: Props) {
 
   // Determine if Dedalus is actively being used
   const dedalusRuns = runs.filter((r) => r.runtime === "dedalus" || r.runtime === "dedalus_degraded");
-  const dedalusMachineId = dedalusRuns[0]?.machine_id;
   const hasDedalus = dedalusRuns.length > 0;
 
   const statusLabel = anyFailed
@@ -97,10 +96,9 @@ export function SystemActivity({ runs, isLoading }: Props) {
         />
         <span className="text-[11px] text-muted-foreground flex-1 text-left">{statusLabel}</span>
 
-        {/* Dedalus machine indicator in header */}
-        {hasDedalus && dedalusMachineId && (
+        {hasDedalus && (
           <span className="text-[9px] font-mono text-cyan-400/60 hidden sm:block">
-            machine {dedalusMachineId.slice(0, 12)}
+            DedalusRunner
           </span>
         )}
         {!hasDedalus && runs.length > 0 && (
@@ -113,23 +111,21 @@ export function SystemActivity({ runs, isLoading }: Props) {
       {expanded && (
         <div className="px-4 pb-3 pt-1 border-t border-border space-y-2">
 
-          {/* Dedalus machine info block */}
-          {hasDedalus && dedalusMachineId && (() => {
+          {hasDedalus && (() => {
             const isHealthy = dedalusRuns.some((r) => r.runtime === "dedalus");
-            const isDegraded = !isHealthy && dedalusRuns.some((r) => r.runtime === "dedalus_degraded");
+            const isLegacyDegraded = !isHealthy && dedalusRuns.some((r) => r.runtime === "dedalus_degraded");
             return (
               <div className={`rounded border px-3 py-2 space-y-1 ${isHealthy ? "border-cyan-500/20 bg-cyan-500/5" : "border-orange-500/20 bg-orange-500/5"}`}>
                 <div className="flex items-center gap-2">
                   <span className={`w-1.5 h-1.5 rounded-full inline-block shrink-0 ${isHealthy ? "bg-cyan-400 animate-pulse" : "bg-orange-400"}`} />
                   <span className={`text-[10px] font-semibold ${isHealthy ? "text-cyan-400" : "text-orange-400"}`}>
-                    {isHealthy ? "Persistent Runtime Active" : "Dedalus Degraded — Machine Unhealthy"}
+                    {isHealthy ? "DedalusRunner active" : isLegacyDegraded ? "Legacy degraded run" : "Dedalus"}
                   </span>
                 </div>
-                <p className={`text-[10px] font-mono ${isHealthy ? "text-cyan-400/70" : "text-orange-400/70"}`}>Machine: {dedalusMachineId}</p>
                 <p className="text-[10px] text-muted-foreground/60">
                   {isHealthy
-                    ? "Input and output artifacts stored on machine filesystem"
-                    : "Machine assigned but not running — LLM executed locally, artifacts not persisted"}
+                    ? "Agents use dedalus_labs.DedalusRunner — structured output from result.final_output (no machine mounts)."
+                    : "Older plan may show degraded machine mode; new runs use DedalusRunner only."}
                 </p>
               </div>
             );

@@ -65,18 +65,18 @@ export function ActionPlanPanel({ plan, changedSections }: Props) {
       </Card>
 
       {/* Priorities */}
-      <Card className={isChanged("top_priorities") ? "border-cyan-500/40" : ""}>
+      <Card className={isChanged("operational_priorities") ? "border-cyan-500/40" : ""}>
         <CardHeader className="pb-2">
           <CardTitle className="text-sm flex items-center gap-2">
-            Top Priorities
-            {isChanged("top_priorities") && (
+            Operational Priorities
+            {isChanged("operational_priorities") && (
               <Badge className="bg-cyan-500/20 text-cyan-400 border-cyan-500/30 text-[10px]">UPDATED</Badge>
             )}
           </CardTitle>
         </CardHeader>
         <CardContent>
           <ol className="space-y-1">
-            {plan.top_priorities.map((p, i) => (
+            {plan.operational_priorities.map((p: string, i: number) => (
               <li key={i} className="flex gap-2 text-sm">
                 <span className="text-primary font-bold shrink-0">{i + 1}.</span>
                 <span>{p}</span>
@@ -102,17 +102,17 @@ export function ActionPlanPanel({ plan, changedSections }: Props) {
       </Card>
 
       {/* Next 30 Min */}
-      <Card className={isChanged("next_30_min") ? "border-cyan-500/40" : ""}>
+      <Card className={isChanged("short_term_actions") ? "border-cyan-500/40" : ""}>
         <CardHeader className="pb-2">
           <CardTitle className="text-sm flex items-center gap-2">
             Next 30 Minutes
-            {isChanged("next_30_min") && (
+            {isChanged("short_term_actions") && (
               <Badge className="bg-cyan-500/20 text-cyan-400 border-cyan-500/30 text-[10px]">UPDATED</Badge>
             )}
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <ActionList items={plan.next_30_min} highlight={isChanged("next_30_min")} />
+          <ActionList items={plan.short_term_actions} highlight={isChanged("short_term_actions")} />
         </CardContent>
       </Card>
 
@@ -122,7 +122,7 @@ export function ActionPlanPanel({ plan, changedSections }: Props) {
           <CardTitle className="text-sm">Next 2 Hours</CardTitle>
         </CardHeader>
         <CardContent>
-          <ActionList items={plan.next_2_hours} />
+          <ActionList items={plan.ongoing_actions} />
         </CardContent>
       </Card>
 

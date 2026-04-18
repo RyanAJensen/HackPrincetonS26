@@ -8,8 +8,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Unilert — Emergency Response Coordination",
-  description: "Multi-agency emergency response coordination powered by AI specialist agents",
+  title: "Unilert — Medical Triage & Patient Transport Coordination",
+  description:
+    "Multi-agent decision support for EMS triage, patient transport, receiving-facility coordination, and incident replanning",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

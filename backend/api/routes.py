@@ -1,13 +1,15 @@
 from __future__ import annotations
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field
+from typing import Optional, Any
 
 from models.incident import Incident, IncidentCreate, IncidentUpdate, IncidentStatus
 from models.plan import PlanVersion, PlanDiff
 from models.agent import AgentRun
 from agents.orchestrator import generate_plan, _generate_diff
+from agents.specialist_agents import run_incident_parser
+from models.agent import AgentRun, AgentType
 from db import (
     save_incident, get_incident, list_incidents,
     save_plan_version, get_plan_version, get_latest_plan, list_plan_versions,
@@ -34,7 +36,7 @@ class ReplanResponse(BaseModel):
 
 @router.get("/health")
 async def health():
-    return {"status": "ok", "service": "sentinel"}
+    return {"status": "ok", "service": "unilert"}
 
 
 # --- Incidents ---
@@ -187,22 +189,22 @@ async def list_campus_resources():
 
 @router.get("/debug/dedalus")
 async def debug_dedalus():
-    """Probe Dedalus API directly — lists machines, confirms key is working."""
+    """Verify dedalus_labs SDK, API key, and DedalusRunner (no machine API)."""
     import os
     api_key = os.getenv("DEDALUS_API_KEY")
     result: dict = {
         "sdk_available": False,
         "api_key_present": bool(api_key),
         "runtime": get_runtime().runtime_name(),
-        "machines": [],
+        "runner_smoke": None,
         "error": None,
     }
 
     try:
-        import dedalus_sdk
+        from dedalus_labs import AsyncDedalus, DedalusRunner
         result["sdk_available"] = True
-    except ImportError:
-        result["error"] = "dedalus_sdk not installed"
+    except ImportError as e:
+        result["error"] = f"dedalus_labs not installed: {e}"
         return result
 
     if not api_key:
@@ -210,17 +212,68 @@ async def debug_dedalus():
         return result
 
     try:
-        client = dedalus_sdk.AsyncDedalus(api_key=api_key)
-        page = await client.machines.list()
-        machines = []
-        async for m in page:
-            machines.append({
-                "machine_id": m.machine_id,
-                "phase": m.status.phase if m.status else "unknown",
-            })
-        result["machines"] = machines
-        result["machine_count"] = len(machines)
+        client = AsyncDedalus(api_key=api_key)
+        runner = DedalusRunner(client)
+        # Minimal runner invocation — confirms key + routing (not full agent JSON)
+        smoke = await runner.run(
+            input='Reply with exactly: {"ok": true}',
+            model=os.getenv("DEDALUS_DEBUG_MODEL", "anthropic/claude-sonnet-4-20250514"),
+            instructions="You output JSON only.",
+            max_steps=2,
+            debug=True,
+            verbose=True,
+        )
+        out = getattr(smoke, "final_output", None) or str(smoke)
+        result["runner_smoke"] = {
+            "final_output_preview": str(out)[:500],
+            "steps_used": getattr(smoke, "steps_used", None),
+        }
     except Exception as e:
         result["error"] = str(e)
 
     return result
+
+
+class DebugIncidentParserBody(BaseModel):
+    """Minimal incident snapshot for isolated Situation Unit (incident_parser) run."""
+
+    incident_type: str = "Isolated debug incident"
+    report: str = (
+        "Water main break at Main St. Two people with minor injuries. "
+        "Scene accessible from east side only."
+    )
+    location: str = "Main Street & Oak Ave, Princeton NJ"
+    severity_hint: Optional[str] = "high"
+    resources: list[dict[str, Any]] = Field(default_factory=list)
+    external_context: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/debug/agents/incident-parser")
+async def debug_incident_parser(body: DebugIncidentParserBody):
+    """
+    Run only the Situation Unit (incident_parser) through the same runtime.execute → call_llm path
+    as production. Does not run other agents or the full orchestrator.
+    Send JSON `{}` to use default scenario fields.
+    """
+    runtime = get_runtime()
+    run = AgentRun(
+        incident_id="debug-incident-parser",
+        plan_version=1,
+        agent_type=AgentType.INCIDENT_PARSER,
+        input_snapshot={
+            "incident_type": body.incident_type,
+            "report": body.report,
+            "location": body.location,
+            "severity_hint": body.severity_hint,
+            "resources": body.resources,
+            "external_context": body.external_context,
+        },
+    )
+    finished = await runtime.execute(run, run_incident_parser)
+    return {
+        "runtime": finished.runtime,
+        "status": finished.status.value,
+        "error_message": finished.error_message,
+        "log_entries": finished.log_entries,
+        "output_artifact": finished.output_artifact,
+    }

@@ -18,7 +18,7 @@ PRINCETON_LON = -74.6672
 async def _get_forecast_office(lat: float, lon: float) -> Optional[dict]:
     """Resolve grid coordinates from lat/lon."""
     try:
-        async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Sentinel/1.0 (campus-response)"}) as client:
+        async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Unilert/1.0 (campus-response)"}) as client:
             r = await client.get(f"{NWS_BASE}/points/{lat:.4f},{lon:.4f}")
             if r.status_code != 200:
                 return None
@@ -33,7 +33,7 @@ async def get_active_alerts(lat: float, lon: float) -> list[dict]:
     Each alert: {event, severity, headline, description, urgency, effective, expires}.
     """
     try:
-        async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Sentinel/1.0 (campus-response)"}) as client:
+        async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Unilert/1.0 (campus-response)"}) as client:
             r = await client.get(
                 f"{NWS_BASE}/alerts/active",
                 params={"point": f"{lat:.4f},{lon:.4f}", "status": "actual"},
@@ -71,7 +71,7 @@ async def get_forecast_summary(lat: float, lon: float) -> Optional[dict]:
         forecast_url = office.get("forecastHourly")
         if not forecast_url:
             return None
-        async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Sentinel/1.0 (campus-response)"}) as client:
+        async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Unilert/1.0 (campus-response)"}) as client:
             r = await client.get(forecast_url)
             if r.status_code != 200:
                 return None

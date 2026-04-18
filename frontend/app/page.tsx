@@ -5,33 +5,34 @@ import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 
 const INCIDENT_TYPES = [
-  "Structure Fire",
   "Mass Casualty / Medical Emergency",
+  "Flash Flood with Injuries / Access Limited",
+  "Hazmat Exposure / Respiratory Casualties",
+  "Severe Storm / Multiple Trauma Casualties",
+  "Structure Fire with Victims",
+  "Transportation Incident with Injuries",
+  "Public Health Emergency",
   "Hazardous Materials Release",
   "Active Threat / Security Incident",
-  "Severe Weather / Natural Disaster",
   "Infrastructure Failure",
-  "Flash Flood / Access Disruption",
-  "Public Health Emergency",
   "Search and Rescue",
-  "Transportation Incident",
 ];
 
 const DEMO_SCENARIOS = [
   {
     id: "demo-flood",
-    label: "Flash Flood — Trapped Patients, EMS Access Blocked",
-    sub: "4 patients trapped, critical transport window closing, delayed EMS access",
+    label: "Flash Flood with Injuries",
+    sub: "Stranded vehicles, injured civilians, delayed EMS access, Washington Road corridor",
   },
   {
     id: "demo-hazmat",
-    label: "Hazmat Exposure — Respiratory Casualties",
-    sub: "Chlorine gas release, 8 patients with respiratory distress, decon triage required",
+    label: "Hazmat Exposure Event",
+    sub: "Respiratory distress risk, decontamination and hospital coordination",
   },
   {
     id: "demo-storm",
-    label: "Severe Storm — Multi-Trauma Mass Casualty",
-    sub: "Building collapse, 8+ injuries, critical patients, blocked transport routes",
+    label: "Severe Storm with Multiple Casualties",
+    sub: "Structural damage, mixed injury severities, transport route disruption",
   },
 ];
 
@@ -47,7 +48,7 @@ export default function LandingPage() {
 
   const startAnalysis = async (incidentId: string) => {
     setStep("loading");
-    setLoadingMsg("Analyzing incident and generating response plan…");
+    setLoadingMsg("Analyzing incident and generating medical response IAP…");
     try {
       await api.incidents.analyze(incidentId);
       router.push(`/incidents/${incidentId}`);
@@ -68,7 +69,7 @@ export default function LandingPage() {
         location: form.location,
         report: form.report,
       });
-      setLoadingMsg("Analyzing incident and generating response plan…");
+      setLoadingMsg("Analyzing incident and generating medical response IAP…");
       await startAnalysis(incident.id);
     } catch (err) {
       setError(String(err));
@@ -82,7 +83,7 @@ export default function LandingPage() {
     try {
       const incident = await api.demo.load(scenarioId);
       setStep("loading");
-      setLoadingMsg("Analyzing incident and generating response plan…");
+      setLoadingMsg("Analyzing incident and generating medical response IAP…");
       await startAnalysis(incident.id);
     } catch (err) {
       setError(String(err));
@@ -125,9 +126,9 @@ export default function LandingPage() {
         <main className="flex-1 flex items-start justify-center px-6 py-12">
           <div className="w-full max-w-xl space-y-6">
             <div>
-              <h1 className="text-xl font-semibold text-foreground mb-1">Report an Incident</h1>
+              <h1 className="text-xl font-semibold text-foreground mb-1">Report a Medical Emergency</h1>
               <p className="text-sm text-muted-foreground">
-                Describe what's happening. We'll generate a structured response plan.
+                Describe patients, access, and hazards. Unilert generates triage priorities, transport routing, and EMS coordination outputs.
               </p>
             </div>
 
@@ -169,7 +170,7 @@ export default function LandingPage() {
                   onChange={(e) => setForm({ ...form, report: e.target.value })}
                   required
                   rows={4}
-                  placeholder="Describe the situation — what happened, who is affected, immediate hazards…"
+                  placeholder="Who is injured, how many, severity if known, EMS access, receiving hospital needs…"
                   className="w-full px-3 py-2.5 rounded border border-border bg-input text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:ring-2 focus:ring-ring"
                 />
               </div>
@@ -182,7 +183,7 @@ export default function LandingPage() {
                 type="submit"
                 className="w-full h-11 bg-primary text-primary-foreground hover:bg-primary/90 text-sm font-semibold"
               >
-                Generate Response Plan →
+                Generate Medical Response IAP →
               </Button>
             </form>
           </div>
@@ -255,7 +256,7 @@ export default function LandingPage() {
 
       <footer className="border-t border-border px-6 py-3 text-center">
         <p className="text-[10px] text-muted-foreground">
-          Decision-support tool · All outputs require human review before action · Not for autonomous emergency control
+          Unilert · EMS & hospital coordination decision-support · Human review required · Not for autonomous dispatch
         </p>
       </footer>
     </div>

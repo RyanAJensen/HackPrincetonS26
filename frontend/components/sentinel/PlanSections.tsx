@@ -180,18 +180,21 @@ export function PlanSections({ plan, diff, changedSections }: Props) {
       </Card>
 
       {/* Top Priorities — Threat Analysis Unit */}
-      <Card className={changed("top_priorities") ? "border-yellow-500/40" : ""}>
+      <Card className={changed("severity") ? "border-yellow-500/40" : ""}>
         <CardHeader className="pb-2">
           <SectionLabel
             label="Priority Threats"
             unit="Threat Analysis Unit"
             sub="Ranked by severity and potential for escalation. Address in order."
-            changed={changed("top_priorities")}
+            changed={changed("severity")}
           />
         </CardHeader>
         <CardContent>
+          {plan.risk_notes.length === 0 ? (
+            <p className="text-xs text-muted-foreground">No priority threats listed.</p>
+          ) : (
           <ol className="space-y-2">
-            {plan.top_priorities.map((p, i) => (
+            {plan.risk_notes.map((p: string, i: number) => (
               <li key={i} className="flex gap-3 text-sm">
                 <span
                   className={`shrink-0 font-bold w-5 text-center rounded text-[11px] leading-5 h-5 ${
@@ -208,6 +211,7 @@ export function PlanSections({ plan, diff, changedSections }: Props) {
               </li>
             ))}
           </ol>
+          )}
         </CardContent>
       </Card>
 
@@ -226,28 +230,28 @@ export function PlanSections({ plan, diff, changedSections }: Props) {
       </Card>
 
       {/* 30-min plan */}
-      <Card className={changed("next_30_min") ? "border-yellow-500/40" : ""}>
+      <Card className={changed("short_term_actions") ? "border-yellow-500/40" : ""}>
         <CardContent className="pt-4">
           <ActionSection
             label="30-Minute Plan"
             unit="Operations Planner"
             sub="Actions to execute once the immediate response is underway."
-            items={plan.next_30_min}
+            items={plan.short_term_actions}
             diff={diff}
-            changed={changed("next_30_min")}
+            changed={changed("short_term_actions")}
           />
         </CardContent>
       </Card>
 
       {/* 2-hour plan */}
-      {plan.next_2_hours.length > 0 && (
+      {plan.ongoing_actions.length > 0 && (
         <Card>
           <CardContent className="pt-4">
             <ActionSection
               label="2-Hour Plan"
               unit="Operations Planner"
               sub="Sustained response and recovery actions."
-              items={plan.next_2_hours}
+              items={plan.ongoing_actions}
               diff={diff}
             />
           </CardContent>
