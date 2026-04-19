@@ -1,0 +1,46 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - backend/.env
+    environment:
+      PORT: 8000
+      DB_PATH: /data/unilert.db
+      OSRM_BASE_URL: ${OSRM_BASE_URL:-http://osrm:5000}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:3000}
+    ports:
+      - "8000:8000"
+    volumes:
+      - unilert-data:/data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+    environment:
+      PORT: 3000
+      INTERNAL_API_URL: http://api:8000/api/v1
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  osrm:
+    image: osrm/osrm-backend:latest
+    profiles: ["routing"]
+    command: ["osrm-routed", "--algorithm", "mld", "/data/region.osrm"]
+    volumes:
+      - ./deploy/osrm:/data:ro
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+volumes:
+  unilert-data:

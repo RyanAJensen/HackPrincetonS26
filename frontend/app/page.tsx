@@ -18,21 +18,35 @@ const INCIDENT_TYPES = [
   "Search and Rescue",
 ];
 
+const EMPTY_FORM = { incident_type: "", location: "", report: "" };
+
 const DEMO_SCENARIOS = [
   {
     id: "demo-flood",
     label: "Flash Flood with Injuries",
     sub: "Stranded vehicles, injured civilians, delayed EMS access, Washington Road corridor",
+    incident_type: "Flash Flood with Injuries / Access Limited",
+    location: "Washington Road at Lake Carnegie Bridge, Princeton, NJ",
+    report:
+      "Heavy rainfall over the past 90 minutes has caused Washington Road to flood at the Lake Carnegie bridge crossing. Water depth is estimated at 18-24 inches and rising rapidly. Four individuals are trapped in two stalled vehicles — one is an elderly female (approx 70s) who is unresponsive; a second occupant has visible head trauma from the collision. Two additional people are ambulatory but stranded on the vehicle roofs. A bystander reports the elderly patient may be in cardiac arrest. Washington Road is the primary EMS corridor to the south side of the jurisdiction — current flooding has made it impassable to standard ambulances. A second water surge is anticipated within 20 minutes as upstream retention basins approach capacity. Penn Medicine Princeton Medical Center has radioed that their trauma bay is nearly full — only 8 beds remain and they have 2 incoming critical patients from an earlier MVA. Capital Health in Trenton has capacity but is 13 miles south.",
   },
   {
     id: "demo-hazmat",
     label: "Hazmat Exposure Event",
     sub: "Respiratory distress risk, decontamination and hospital coordination",
+    incident_type: "Hazmat Exposure / Respiratory Casualties",
+    location: "Nassau Street Research Facility, Princeton, NJ",
+    report:
+      "At 2:14 PM, a pressurized cylinder of chlorine gas ruptured in a ground-floor laboratory at a research facility on Nassau Street. Twelve personnel were present in the immediate area. Three occupants have collapsed with severe respiratory distress and are unable to self-evacuate; one is unconscious. Five additional personnel have evacuated but report burning eyes, throat irritation, and difficulty breathing. Four personnel are unaccounted for. The building has not been fully evacuated. Ventilation systems are running, potentially distributing contaminated air to adjacent floors. An estimated 200 additional personnel are in neighboring buildings within the plume zone. Wind is currently 8 mph from the west. No decontamination corridor has been established. Capital Health in Trenton is the only regional facility with full decon capability. Penn Medicine has limited decon capacity and is currently at elevated status from earlier admissions.",
   },
   {
     id: "demo-storm",
     label: "Severe Storm with Multiple Casualties",
     sub: "Structural damage, mixed injury severities, transport route disruption",
+    incident_type: "Severe Storm / Multiple Trauma Casualties",
+    location: "Princeton Community Center, Witherspoon Street, Princeton, NJ",
+    report:
+      "A fast-moving severe thunderstorm cell crossed the area at 4:45 PM with sustained winds of 62 mph. A partial roof collapse occurred at the Princeton Community Center on Witherspoon Street — approximately 40 people were inside. Confirmed injuries: 2 patients with crush injuries (one with suspected spinal trauma), 3 with lacerations requiring suturing, 2 with suspected fractures, 1 in respiratory distress from dust inhalation. Approximately 12 additional individuals have minor injuries. A large tree has fallen across Witherspoon Street — the primary EMS route to Penn Medicine Princeton Medical Center is blocked. Penn Medicine is reporting critical capacity: only 4 trauma beds available and their ED is on diversion advisory. The alternate route via Route 1 to Capital Health adds 18 minutes. Robert Wood Johnson in New Brunswick has 11 beds at elevated status. Power is out across 6 blocks. A second storm cell arrives in 22 minutes.",
   },
 ];
 
@@ -41,15 +55,14 @@ type Step = "home" | "form" | "loading";
 export default function LandingPage() {
   const router = useRouter();
   const [step, setStep] = useState<Step>("home");
-  const [form, setForm] = useState({ incident_type: "", location: "", report: "" });
-  const [loadingDemo, setLoadingDemo] = useState("");
+  const [form, setForm] = useState(EMPTY_FORM);
+  const [selectedDemoId, setSelectedDemoId] = useState("");
   const [error, setError] = useState("");
   const [loadingMsg, setLoadingMsg] = useState("");
 
-  const startAnalysis = async (incidentId: string) => {
+  const openIncidentDashboard = async (incidentId: string) => {
     setStep("loading");
-    setLoadingMsg("Analyzing incident and generating medical response IAP…");
-    await api.incidents.analyze(incidentId);
+    setLoadingMsg("Opening live incident dashboard…");
     router.push(`/incidents/${incidentId}`);
   };
 
@@ -64,28 +77,30 @@ export default function LandingPage() {
         location: form.location,
         report: form.report,
       });
-      setLoadingMsg("Analyzing incident and generating medical response IAP…");
-      await startAnalysis(incident.id);
+      await openIncidentDashboard(incident.id);
     } catch (err) {
       setError(String(err));
       setStep("form");
     }
   };
 
-  const handleDemo = async (scenarioId: string) => {
-    setLoadingDemo(scenarioId);
-    setError("");
-    try {
-      const incident = await api.demo.load(scenarioId);
-      setStep("loading");
-      setLoadingMsg("Analyzing incident and generating medical response IAP…");
-      await startAnalysis(incident.id);
-    } catch (err) {
-      setError(String(err));
-      setStep("home");
-      setLoadingDemo("");
+  const handleDemo = (scenarioId: string) => {
+    const scenario = DEMO_SCENARIOS.find((item) => item.id === scenarioId);
+    if (!scenario) {
+      setError("Demo scenario not found.");
+      return;
     }
+    setError("");
+    setSelectedDemoId(scenario.id);
+    setForm({
+      incident_type: scenario.incident_type,
+      location: scenario.location,
+      report: scenario.report,
+    });
+    setStep("form");
   };
+
+  const selectedDemo = DEMO_SCENARIOS.find((item) => item.id === selectedDemoId) ?? null;
 
   // --- Loading screen ---
   if (step === "loading") {
@@ -98,7 +113,7 @@ export default function LandingPage() {
           <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin mx-auto" />
           <p className="text-sm text-foreground font-medium">{loadingMsg}</p>
           <p className="text-xs text-muted-foreground">
-            Situation → Medical Impact → Triage → Patient Transport → Communications
+            Live dashboard first, agent results stream in as they complete
           </p>
         </div>
       </div>
@@ -111,7 +126,12 @@ export default function LandingPage() {
       <div className="min-h-screen bg-background flex flex-col">
         <header className="border-b border-border px-6 py-4 flex items-center gap-4">
           <button
-            onClick={() => { setStep("home"); setError(""); setForm({ incident_type: "", location: "", report: "" }); }}
+            onClick={() => {
+              setStep("home");
+              setError("");
+              setSelectedDemoId("");
+              setForm(EMPTY_FORM);
+            }}
             className="text-muted-foreground hover:text-foreground text-xs transition-colors"
           >
             ← Back
@@ -127,6 +147,18 @@ export default function LandingPage() {
                 Describe patients, access, and hazards. Unilert generates triage priorities, transport routing, and EMS coordination outputs.
               </p>
             </div>
+
+            {selectedDemo && (
+              <div className="rounded border border-primary/30 bg-primary/8 px-4 py-3">
+                <p className="text-[10px] uppercase tracking-[0.2em] text-primary font-semibold mb-1">
+                  Demo Template Loaded
+                </p>
+                <p className="text-sm text-foreground font-medium">{selectedDemo.label}</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Scenario details are prefilled below. Adjust anything you want before submitting the incident.
+                </p>
+              </div>
+            )}
 
             <form onSubmit={handleFormSubmit} className="space-y-5">
               <div className="space-y-1.5">
@@ -159,7 +191,7 @@ export default function LandingPage() {
 
               <div className="space-y-1.5">
                 <label className="text-[10px] text-muted-foreground uppercase tracking-widest font-semibold">
-                  What's Happening
+                  What&apos;s Happening
                 </label>
                 <textarea
                   value={form.report}
@@ -179,7 +211,7 @@ export default function LandingPage() {
                 type="submit"
                 className="w-full h-11 bg-primary text-primary-foreground hover:bg-primary/90 text-sm font-semibold"
               >
-                Generate Medical Response IAP →
+                {selectedDemo ? "Submit Prefilled Demo Incident →" : "Generate Medical Response IAP →"}
               </Button>
             </form>
           </div>
@@ -232,7 +264,6 @@ export default function LandingPage() {
               <button
                 key={s.id}
                 onClick={() => handleDemo(s.id)}
-                disabled={!!loadingDemo}
                 className="w-full flex items-start gap-4 p-4 rounded border border-border bg-card hover:border-primary/50 hover:bg-primary/5 transition-all text-left disabled:opacity-50"
               >
                 <div className="flex-1 min-w-0">
@@ -240,7 +271,7 @@ export default function LandingPage() {
                   <p className="text-xs text-muted-foreground mt-0.5">{s.sub}</p>
                 </div>
                 <span className="text-xs text-muted-foreground shrink-0 mt-0.5">
-                  {loadingDemo === s.id ? "Loading…" : "Run →"}
+                  Use Template →
                 </span>
               </button>
             ))}

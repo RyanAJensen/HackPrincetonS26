@@ -1,10 +1,36 @@
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api/v1";
+function defaultApiBase() {
+  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL;
+  if (typeof window === "undefined" && process.env.INTERNAL_API_URL) {
+    return process.env.INTERNAL_API_URL;
+  }
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname || "localhost";
+    return `http://${host}:8000/api/v1`;
+  }
+  return "http://localhost:8000/api/v1";
+}
+
+function networkFailureMessage(url: string, err: unknown) {
+  const detail = err instanceof Error ? err.message : String(err);
+  return (
+    `Unable to reach the Unilert backend at ${url}. ` +
+    `Make sure the FastAPI server is running on port 8000 and that NEXT_PUBLIC_API_URL points to the correct backend. ` +
+    `If you opened the frontend on a network hostname or IP, the backend must be reachable from that same host. ` +
+    `Original error: ${detail}`
+  );
+}
 
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-  });
+  const url = `${defaultApiBase()}${path}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { "Content-Type": "application/json" },
+      ...opts,
+    });
+  } catch (err) {
+    throw new Error(networkFailureMessage(url, err));
+  }
   if (!res.ok) {
     const err = await res.text();
     throw new Error(err || res.statusText);
@@ -92,8 +118,122 @@ export interface Resource {
   name: string;
   role: string;
   available: boolean;
+  deployment_status?: string;
+  ics_group?: string | null;
   location?: string;
   contact?: string;
+}
+
+export interface IncidentLogEntry {
+  timestamp: string;
+  source: string;
+  category: string;
+  message: string;
+}
+
+export interface CommandRecommendations {
+  command_mode: string;
+  command_post_established: boolean;
+  unified_command_recommended: boolean;
+  safety_officer_recommended: boolean;
+  public_information_officer_recommended?: boolean;
+  liaison_officer_recommended?: boolean;
+  operations_section_active?: boolean;
+  planning_section_active?: boolean;
+  logistics_section_active?: boolean;
+  finance_admin_section_active?: boolean;
+  triage_group_active?: boolean;
+  treatment_group_active?: boolean;
+  staging_area: string;
+  transport_group_active: boolean;
+  rationale: string[];
+}
+
+export interface CommandTransferSummary {
+  command_mode: string;
+  current_strategy: string;
+  active_groups: string[];
+  top_hazards: string[];
+  next_decisions: string[];
+  resource_status?: string[];
+  transfer_needs?: string[];
+  last_update: string;
+}
+
+export interface ICSRoleAssignment {
+  role: string;
+  assigned_to?: string | null;
+  agency?: string | null;
+  active: boolean;
+  responsibilities: string[];
+}
+
+export interface OwnedOperationalAction {
+  description: string;
+  owner_role: string;
+  owner_name?: string | null;
+  operational_group?: string | null;
+  timeframe?: string | null;
+  priority: number;
+  contingency?: string | null;
+  critical: boolean;
+}
+
+export interface SpanOfControlWarning {
+  supervisor_role: string;
+  direct_reports: number;
+  recommended_structure: string;
+  reason: string;
+  severity: string;
+}
+
+export interface AccountabilityIssue {
+  kind: string;
+  severity: string;
+  message: string;
+  action_description?: string | null;
+  owner_role?: string | null;
+}
+
+export interface AccountabilityReport {
+  status: string;
+  unowned_actions: string[];
+  conflicting_assignments: string[];
+  duplicate_assignments: string[];
+  self_dispatch_risks: string[];
+  issues: AccountabilityIssue[];
+}
+
+export interface MedicalOperationsBranch {
+  group_name: string;
+  owner_role: string;
+  objectives: string[];
+  actions: OwnedOperationalAction[];
+  status: string;
+}
+
+export interface MedicalOperationsSummary {
+  triage: MedicalOperationsBranch;
+  treatment: MedicalOperationsBranch;
+  transport: MedicalOperationsBranch;
+}
+
+export interface IncidentActionPlan {
+  command_intent: string;
+  current_objectives: string[];
+  organization: ICSRoleAssignment[];
+  owned_actions: OwnedOperationalAction[];
+  communications_plan: string[];
+  responder_injury_contingency: string[];
+  degradation_triggers: string[];
+  operational_period: string;
+}
+
+export interface FallbackSummary {
+  mode_active: boolean;
+  safe_to_act_on: string[];
+  unavailable_components: string[];
+  unverified_assumptions: string[];
 }
 
 export interface Incident {
@@ -104,7 +244,25 @@ export interface Incident {
   report: string;
   location: string;
   severity_hint?: SeverityLevel;
+  hazards?: string[];
+  access_constraints?: string[];
+  estimated_patients?: number;
+  triage_counts?: { critical: number; moderate: number; minor: number };
+  command_mode?: string | null;
+  command_post_established?: boolean;
+  unified_command?: boolean;
+  safety_officer_assigned?: boolean;
+  staging_area?: string | null;
+  operational_objectives?: string[];
   resources: Resource[];
+  ics_organization?: ICSRoleAssignment[];
+  assigned_resources?: string[];
+  staged_resources?: string[];
+  requested_resources?: string[];
+  out_of_service_resources?: string[];
+  transport_group_active?: boolean;
+  current_bottlenecks?: string[];
+  incident_log?: IncidentLogEntry[];
   hospital_capacities: HospitalCapacity[];
   status: IncidentStatus;
   current_plan_version: number;
@@ -191,6 +349,15 @@ export interface PlanVersion {
   // Patient flow & facility routing decisions
   patient_flow?: PatientFlowSummary | null;
   decision_points: DecisionPoint[];
+  command_recommendations?: CommandRecommendations | null;
+  owned_actions?: Record<string, string[]>;
+  owned_action_items?: OwnedOperationalAction[];
+  ics_organization?: ICSRoleAssignment[];
+  span_of_control?: SpanOfControlWarning[];
+  accountability?: AccountabilityReport | null;
+  medical_operations?: MedicalOperationsSummary | null;
+  iap?: IncidentActionPlan | null;
+  command_transfer_summary?: CommandTransferSummary | null;
   tradeoffs: Tradeoff[];
 
   // Legacy triage (kept for compat)
@@ -200,6 +367,16 @@ export interface PlanVersion {
 
   diff_summary?: string;
   changed_sections?: string[];
+  first_response_ready?: boolean;
+  enrichment_pending?: boolean;
+  fallback_mode?: boolean;
+  recommendation_confidence?: number;
+  route_confidence?: string;
+  unavailable_components?: string[];
+  verified_information?: string[];
+  assumed_information?: string[];
+  fallback_summary?: FallbackSummary | null;
+  incident_log?: IncidentLogEntry[];
   external_context?: {
     geocoded?: boolean;
     coordinates?: { lat: number; lon: number };
@@ -208,14 +385,24 @@ export interface PlanVersion {
     alert_count?: number;
     forecast?: { temperature_f?: number; short_forecast?: string; wind_speed?: string } | null;
     weather_risk?: string;
-    routing?: { duration_min?: number; distance_mi?: number; steps?: string[]; origin?: string } | null;
+    routing?: { duration_min?: number; distance_mi?: number; steps?: string[]; origin?: string; provider?: string; alternate_steps?: string[] } | null;
     fema_context?: string[];
     weather_driven_threats?: string[];
     replan_triggers?: string[];
+    water_context?: {
+      nearest_gage?: string | null;
+      distance_mi?: number | null;
+      gage_height_ft?: number | null;
+      streamflow_cfs?: number | null;
+      water_risk?: string;
+      signals?: string[];
+    } | null;
     primary_access_route?: string | null;
     alternate_access_route?: string | null;
     healthcare_risks?: string[];
-    hospitals?: { name: string; distance_mi?: number | null; trauma_level?: string | null }[];
+    hospitals?: { name: string; distance_mi?: number | null; trauma_level?: string | null; facility_type?: string | null; capabilities?: string[] }[];
+    hospital_directory_source?: string;
+    routing_provider?: string;
     dedalus_execution?: string;
   };
 }
@@ -244,6 +431,12 @@ export interface AgentRun {
   machine_id?: string;
   output_artifact?: Record<string, unknown>;
   error_message?: string;
+  error_kind?: string;
+  retry_count?: number;
+  latency_ms?: number;
+  required?: boolean;
+  degraded?: boolean;
+  fallback_used?: boolean;
   log_entries: string[];
 }
 
@@ -260,12 +453,19 @@ export interface ReplanResponse {
   agent_runs: AgentRun[];
 }
 
+export interface LiveIncidentResponse {
+  incident: Incident;
+  plan?: PlanVersion | null;
+  agent_runs: AgentRun[];
+}
+
 // --- API calls ---
 
 export const api = {
   incidents: {
     list: () => req<Incident[]>("/incidents"),
     get: (id: string) => req<Incident>(`/incidents/${id}`),
+    live: (id: string) => req<LiveIncidentResponse>(`/incidents/${id}/live`),
     create: (body: { incident_type: string; report: string; location: string; severity_hint?: string; resources?: Resource[] }) =>
       req<Incident>("/incidents", { method: "POST", body: JSON.stringify(body) }),
     analyze: (id: string) => req<AnalysisResponse>(`/incidents/${id}/analyze`, { method: "POST" }),

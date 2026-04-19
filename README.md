@@ -1,7 +1,7 @@
-# Unilert — Campus Incident Response Copilot
+# Unilert — Live EMS / ICS Coordination on Dedalus Machines
 
-Adaptive AI-powered decision-support tool for campus emergency response.  
-Built with Next.js, FastAPI, Claude, and Dedalus Machines.
+Real-time emergency medical operations system for EMS supervisors, incident commanders, and hospital coordination leads.  
+Built with Next.js, FastAPI, a deterministic ICS decision engine, Dedalus Machines agent swarming, and K2 Think V2.
 
 ---
 
@@ -20,14 +20,20 @@ sentinel/
 │   ├── db/
 │   │   └── store.py              # SQLite persistence (Postgres-swappable)
 │   ├── agents/
-│   │   ├── llm.py                # Anthropic API wrapper
+│   │   ├── llm.py                # Strict structured LLM wrapper (K2 + Dedalus paths)
 │   │   ├── prompts.py            # Prompt templates for each agent
 │   │   ├── specialist_agents.py  # 4 agent functions
-│   │   └── orchestrator.py       # Sequential pipeline + plan synthesis + diff
+│   │   └── orchestrator.py       # Two-speed orchestration: local-first + swarm enrichment
 │   ├── runtime/
 │   │   ├── base.py               # AgentRuntime ABC
 │   │   ├── local_runtime.py      # LocalAgentRuntime
-│   │   └── dedalus_runtime.py    # DedalusAgentRuntime (falls back gracefully)
+│   │   ├── dedalus_runtime.py    # DedalusRunner runtime
+│   │   └── dedalus_machine_runtime.py  # Dedalus Machines swarm runtime
+│   ├── services/
+│   │   ├── decision_engine.py    # Deterministic ICS / transport logic
+│   │   ├── context_ingestion_service.py
+│   │   ├── routing_service.py
+│   │   └── hospital_directory_service.py
 │   └── data/
 │       └── seed.py               # Demo scenarios + campus resources
 └── frontend/
@@ -57,10 +63,13 @@ sentinel/
 
 **Backend** (`backend/.env`):
 ```
-ANTHROPIC_API_KEY=sk-ant-...     # Required
-DEDALUS_API_KEY=                 # Optional — falls back to local runtime
-DEDALUS_PROJECT_ID=unilert
-RUNTIME_MODE=dedalus             # "dedalus" | "local"
+DEDALUS_API_KEY=dsk-...          # Required for Dedalus Machines swarm mode
+K2_API_KEY=ifm-...               # Required to make K2 Think V2 the swarm reasoning core
+LLM_BACKEND=k2                   # Prefer K2 in local + remote machine workers
+K2_MODEL=MBZUAI-IFM/K2-Think-v2
+RUNTIME_MODE=swarm               # "swarm" | "dedalus" | "local"
+ROUTING_PROVIDER=osrm
+OSRM_BASE_URL=http://osrm:5000
 ```
 
 **Frontend** (`frontend/.env.local`):
@@ -101,17 +110,20 @@ Open `http://localhost:3000`.
 
 ---
 
-## How Dedalus Is Integrated
+## How Dedalus + K2 Are Integrated
 
-Each of the four specialist agents (Incident Parser, Risk Assessor, Action Planner, Communications) is executed through a `DedalusAgentRuntime`:
+Unilert uses a **two-speed architecture**:
 
-1. **Machine creation**: When an agent run starts, a Dedalus Machine is created with incident metadata attached (`incident_id`, `agent_type`, `plan_version`, `run_id`).
-2. **Persistent state**: Each machine represents one agent execution and can be inspected, resumed, or replayed independently.
-3. **Artifact persistence**: After the agent function completes, structured output is stored in the machine's artifact store via `artifacts.put(key="output", ...)`.
-4. **Machine ID tracking**: The `machine_id` is stored on `AgentRun` and shown in the Agent Status Panel UI, making Dedalus visibility first-class.
-5. **Graceful fallback**: If `DEDALUS_API_KEY` is not set, the runtime falls back to in-process execution with a synthetic `machine_id` (shown as `local-xxxxxxxx`).
+1. **Immediate answer (2–5s)**: deterministic local normalization + decision engine produce the first ICS-safe operational answer.
+2. **Swarm enrichment**: four specialist agents run on **Dedalus Machines** and progressively enhance the live decision surface:
+   - `incident_parser`
+   - `risk_assessor`
+   - `action_planner`
+   - `communications`
 
-The `AgentRuntime` ABC makes the runtime entirely swappable — set `RUNTIME_MODE=local` to bypass Dedalus entirely for development.
+When `K2_API_KEY` is set, those machine workers use **K2 Think V2** as the core remote reasoning model. This keeps K2 central to the product instead of a side call, while preserving Dedalus Machines as the swarm execution layer.
+
+If swarm enrichment is unavailable, the deterministic local decision surface still works and remains operationally useful.
 
 ---
 
@@ -120,13 +132,13 @@ The `AgentRuntime` ABC makes the runtime entirely swappable — set `RUNTIME_MOD
 | Feature | Status |
 |---|---|
 | Incident creation | Live |
-| Agent pipeline (4 agents) | Live (calls Claude) |
+| Agent pipeline (4 agents) | Live (Dedalus Machines swarm, K2-capable) |
 | Plan synthesis | Live |
 | Plan diff generation | Live |
 | Replanning | Live |
-| Dedalus machine creation | Live if `DEDALUS_API_KEY` set; mocked (local fallback) otherwise |
+| Dedalus machine creation | Live if `DEDALUS_API_KEY` set |
 | Map embed | Static OpenStreetMap (Princeton campus coordinates) |
-| Resource assignment | Seeded static data |
+| Resource assignment | Deterministic ICS decision engine + static/open context |
 
 ---
 

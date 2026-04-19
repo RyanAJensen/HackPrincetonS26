@@ -216,6 +216,10 @@ def _use_dedalus_runner_for_llm() -> bool:
     return os.getenv("RUNTIME_MODE", "dedalus") != "local" and not is_dedalus_auth_failed()
 
 
+def _allow_runtime_fallback() -> bool:
+    return os.getenv("ALLOW_RUNTIME_FALLBACK_TO_LOCAL", "").lower() in ("1", "true", "yes")
+
+
 def _get_runner_for_call() -> Any | None:
     runner = dedalus_runner_ctx.get()
     if runner is not None:
@@ -427,7 +431,7 @@ async def _call_dedalus_runner(
         except Exception as exc:
             exc_str = str(exc)
             is_auth = "401" in exc_str or "invalid_api_key" in exc_str or "Key inactive" in exc_str
-            if is_auth:
+            if is_auth and _allow_runtime_fallback():
                 from agents.dedalus_context import mark_dedalus_auth_failed
                 mark_dedalus_auth_failed()
                 print(f"[LLM] Dedalus auth error ({caller}) — switching to local K2 for all calls")
@@ -464,6 +468,7 @@ async def _call_dedalus_machine(
     system: str,
     caller: str,
     response_model: Optional[type[BaseModel]] = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     response_model = _require_response_model(response_model)
     sys = _build_system_prompt(system)
@@ -478,6 +483,7 @@ async def _call_dedalus_machine(
                 system=sys,
                 caller=caller,
                 response_model=response_model,
+                timeout_seconds=timeout_seconds,
             )
             payload = _coerce_response_payload(raw_stdout, response_model, caller, "DedalusMachine")
             _finalize_success("DedalusMachine", caller, started_at, attempt)
@@ -693,6 +699,7 @@ async def call_llm(
             system,
             caller,
             response_model=response_model,
+            timeout_seconds=timeout_seconds,
         )
 
     dedalus_requested = _use_dedalus_runner_for_llm()

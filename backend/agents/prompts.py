@@ -62,11 +62,14 @@ Rules: Patient counts must be grounded in the report. If no injuries confirmed, 
 
 RISK_ASSESSOR_PROMPT = """\
 You are the INTELLIGENCE UNIT for a regional healthcare surge coordination system.
-Identify capacity bottlenecks, transport failures, and decision triggers.
-This output drives routing and facility assignment decisions.
+Interpret the computed decision state for command staff.
+Do NOT recompute patient allocation, route selection, or hospital choice.
 
-Situation Status:
-{parsed_data}
+Computed Decision State:
+{decision_state}
+
+Deterministic Risk Core:
+{computed_risk}
 
 EMS Resources: {resources}
 
@@ -101,6 +104,7 @@ Return JSON:
 
 Rules: capacity_bottlenecks must name specific facilities. decision_triggers must be observable.
 cascade_risks must trace the actual routing consequence.
+Do not invent facilities or routes that are not present in the computed decision state.
 """
 
 # ─── Operations Planner (K2 Think V2 routing + triage reasoning) ──────────────
@@ -108,12 +112,16 @@ cascade_risks must trace the actual routing consequence.
 
 ACTION_PLANNER_PROMPT = """\
 You are the OPERATIONS PLANNER for a regional healthcare surge coordination system.
-Decide: where do patients go, in what order, via which route, and why.
+Turn the computed decision state into operator-ready instructions.
+Do NOT recompute where patients go, change counts, or invent new routes/facilities.
 
-Situation Status:
-{parsed_data}
+Computed Decision State:
+{decision_state}
 
-Intelligence Assessment:
+Deterministic Risk Core:
+{computed_risk}
+
+Advisory Risk Interpretation:
 {risk_data}
 
 EMS Resources: {resources}
@@ -198,6 +206,8 @@ Return JSON:
 Rules: facility_assignments must cover all incoming patients (counts must sum).
 Max 5 items per action phase. Max 3 tradeoffs. Strings under 100 chars.
 If no confirmed injuries: set counts to 0 and explain in distribution_rationale.
+patient_flow, triage_priorities, patient_transport, primary_access_route, and alternate_access_route
+must match the computed decision state exactly.
 """
 
 # ─── Communications Officer ────────────────────────────────────────────────────
@@ -265,23 +275,27 @@ JSON only. Strings under 80 chars. hazards/unknowns max 3 items each.
 """
 
 LEAN_RISK_PROMPT = """\
-Threat analyst. Identify routing blockers only.
+Threat analyst. Interpret computed routing blockers only.
+Do not invent new hospitals, routes, or patient counts.
 
-{situation_summary}
+{decision_state}
 
 JSON only. top_risks/bottlenecks/replan_triggers max 3 items each. Strings under 60 chars.
 """
 
 LEAN_PLANNER_PROMPT = """\
-Operations planner. Decide where patients go and in what order.
+Operations planner. Convert computed state into ICS-style field actions.
+Use plain English. Every action must have a clear owner role.
+Do not change patient counts, destination hospitals, or routes.
 
-Situation: {situation_summary}
+Decision state: {decision_state}
 Risks: {risk_summary}
 Route: {primary_route} ({route_duration}) | Alt: {alternate_route_note}
 Facilities: {hospital_context}
 Capacity: {hospital_capacity_summary}
 
-JSON only. immediate_actions/short_term_actions max 5 strings each. facility_assignments must sum to total_patients. Strings under 100 chars.
+JSON only. No narrative explanation. Focus on command, triage, treatment, transport, and staging.
+immediate_actions/short_term_actions max 5 strings each. facility_assignments must sum to total_patients. Strings under 100 chars.
 """
 
 LEAN_COORDINATION_PROMPT = """\
@@ -298,7 +312,8 @@ JSON only. immediate_actions max 5 strings. facility_assignments must sum to pat
 """
 
 LEAN_COMMS_PROMPT = """\
-Draft 4 operational messages. Be specific, concise, action-oriented.
+Draft 4 ICS-style operational messages. Be specific, concise, action-oriented.
+No vague advisory language. Reference command, transport, or receiving actions when relevant.
 
 {situation_summary}
 Severity: {severity} | Location: {location}
@@ -339,10 +354,14 @@ Return JSON with the same schema as the full parser. Be concise. Patient counts 
 """
 
 RISK_ASSESSOR_REDUCED_PROMPT = """\
-You are the INTELLIGENCE UNIT. Identify the top routing blockers and decision triggers only.
+You are the INTELLIGENCE UNIT. Interpret the top routing blockers and decision triggers only.
+Do not recompute allocation or invent facilities/routes.
 
-Situation:
-{parsed_data}
+Computed Decision State:
+{decision_state}
+
+Deterministic Risk Core:
+{computed_risk}
 
 Resources: {resources}
 Weather ({alert_count} alerts): {weather_alerts} | {forecast_summary} | Risk: {weather_risk_level}
@@ -360,13 +379,17 @@ Return compact JSON — same schema, fewer items per list (max 3 each).
 """
 
 ACTION_PLANNER_REDUCED_PROMPT = """\
-You are the OPERATIONS PLANNER. Decide where patients go and in what order.
+You are the OPERATIONS PLANNER. Convert the computed allocation into concise field instructions.
+Do not change patient counts, facilities, or routes.
 
-Situation:
-{parsed_data}
+Computed Decision State:
+{decision_state}
 
-Risk Context:
+Advisory Risk Context:
 {risk_data}
+
+Deterministic Risk Core:
+{computed_risk}
 
 Resources: {resources}
 Location: {location}
@@ -389,6 +412,7 @@ All facility_assignments must sum to total_incoming.
   "primary_access_route": null, "alternate_access_route": null,
   "assumptions": [], "missing_information": [], "resource_assignments": {{"operations": [], "logistics": [], "communications": [], "command": []}}
 }}
+Computed patient_flow / triage / transport fields must remain unchanged.
 """
 
 # ─── Replanning context ────────────────────────────────────────────────────────

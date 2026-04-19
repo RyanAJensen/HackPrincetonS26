@@ -13,7 +13,10 @@ from runtime.dedalus_client_config import (
     build_dedalus_client_kwargs,
     dedalus_byok_configured,
     describe_dedalus_billing_mode,
+    describe_swarm_reasoning_mode,
+    k2_configured,
     machine_worker_env_lines,
+    swarm_enrichment_backend_ready,
 )
 
 
@@ -46,3 +49,18 @@ class DedalusClientConfigTests(unittest.TestCase):
             self.assertIn("DEDALUS_PROVIDER=openai", blob)
             self.assertIn("DEDALUS_PROVIDER_KEY=sk-openai-test", blob)
             self.assertIn("DEDALUS_PROVIDER_MODEL=gpt-4o", blob)
+
+    def test_machine_worker_env_lines_default_to_k2_when_available(self) -> None:
+        env = {
+            "K2_API_KEY": "ifm-test",
+            "K2_MODEL": "MBZUAI-IFM/K2-Think-v2",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            blob = machine_worker_env_lines("dsk-test")
+            self.assertIn("DEDALUS_API_KEY=dsk-test", blob)
+            self.assertIn("LLM_BACKEND=k2", blob)
+            self.assertIn("K2_API_KEY=ifm-test", blob)
+            self.assertIn("K2_MODEL=MBZUAI-IFM/K2-Think-v2", blob)
+            self.assertTrue(k2_configured())
+            self.assertTrue(swarm_enrichment_backend_ready())
+            self.assertIn("K2 Think V2", describe_swarm_reasoning_mode())

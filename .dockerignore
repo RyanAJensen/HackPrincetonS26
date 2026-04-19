@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+backend/__pycache__
+backend/**/*.pyc
+backend/db/*.db
+frontend/.next
+frontend/node_modules
+frontend/npm-debug.log
+**/.DS_Store

@@ -2,13 +2,14 @@ from __future__ import annotations
 from datetime import datetime
 import inspect
 from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Any
 
-from models.incident import Incident, IncidentCreate, IncidentUpdate, IncidentStatus
+from models.incident import Incident, IncidentCreate, IncidentUpdate, IncidentStatus, IncidentLogEntry, TriageCounts
 from models.plan import PlanVersion, PlanDiff
 from models.agent import AgentFailure, AgentRun, AgentType
-from agents.orchestrator import _generate_diff, collect_agent_failures, generate_plan
+from agents.orchestrator import _generate_diff, collect_agent_failures, generate_initial_plan, generate_plan
 from agents.specialist_agents import run_incident_parser
 from db import (
     save_incident, get_incident, list_incidents,
@@ -19,6 +20,7 @@ from data.seed import DEMO_SCENARIOS, REGIONAL_RESOURCES as CAMPUS_RESOURCES
 from runtime import get_runtime
 from runtime.dedalus_client_config import dedalus_byok_configured
 from runtime.dedalus_output import extract_final_output, validate_response_output
+from services import build_readiness_report
 
 router = APIRouter()
 
@@ -74,13 +76,173 @@ class ReplanResponse(BaseModel):
     agent_failures: list[AgentFailure] = Field(default_factory=list)
 
 
+class LiveIncidentResponse(BaseModel):
+    incident: Incident
+    plan: Optional[PlanVersion] = None
+    agent_runs: list[AgentRun] = Field(default_factory=list)
+
+
 class DebugDedalusSmokeOutput(BaseModel):
     ok: bool
 
 
+def _append_incident_log(incident: Incident, *, source: str, category: str, message: str) -> None:
+    incident.incident_log = [
+        *(incident.incident_log or []),
+        IncidentLogEntry(source=source, category=category, message=message),
+    ][-100:]
+
+
+def _mark_enrichment_failure(plan: PlanVersion, *, unavailable_components: list[str], detail: str) -> PlanVersion:
+    plan.enrichment_pending = False
+    plan.fallback_mode = True
+    plan.unavailable_components = list(dict.fromkeys((plan.unavailable_components or []) + unavailable_components))[:8]
+    plan.diff_summary = plan.diff_summary or "Swarm enrichment unavailable; local operational recommendation remains active."
+    if plan.fallback_summary is not None:
+        plan.fallback_summary.mode_active = True
+        plan.fallback_summary.unavailable_components = list(
+            dict.fromkeys((plan.fallback_summary.unavailable_components or []) + unavailable_components)
+        )[:8]
+        if detail:
+            plan.fallback_summary.unverified_assumptions = list(
+                dict.fromkeys((plan.fallback_summary.unverified_assumptions or []) + [detail])
+            )[:8]
+    return plan
+
+
+def _actual_unavailable_components(incident_id: str, version: int) -> list[str]:
+    runs = list_agent_runs(incident_id, version)
+    components: list[str] = []
+    for run in runs:
+        has_output = isinstance(run.output_artifact, dict) and bool(run.output_artifact)
+        if run.status == "failed" and not (run.fallback_used and has_output):
+            components.append(run.agent_type)
+    return list(dict.fromkeys(components))
+
+
+async def _complete_enrichment_for_version(
+    incident_id: str,
+    version: int,
+    *,
+    update_text: Optional[str] = None,
+) -> None:
+    incident = get_incident(incident_id)
+    if not incident or incident.current_plan_version != version:
+        return
+    try:
+        plan, _ = await generate_plan(incident, version, update_text, previous_plan=None)
+        latest_incident = get_incident(incident_id)
+        if not latest_incident or latest_incident.current_plan_version != version:
+            return
+        _sync_incident_state_from_plan(latest_incident, plan)
+        latest_incident.status = IncidentStatus.ACTIVE
+        latest_incident.updated_at = datetime.utcnow()
+        _append_incident_log(
+            latest_incident,
+            source="system",
+            category="enrichment",
+            message=f"Swarm enrichment merged into plan v{version}",
+        )
+        save_plan_version(plan)
+        save_incident(latest_incident)
+    except Exception as exc:
+        latest_incident = get_incident(incident_id)
+        if not latest_incident or latest_incident.current_plan_version != version:
+            return
+        plan = get_plan_version(incident_id, version)
+        if plan is not None:
+            detail = str(exc)[:220]
+            unavailable = _actual_unavailable_components(incident_id, version)
+            if not unavailable:
+                unavailable = ["swarm_enrichment"]
+            _mark_enrichment_failure(plan, unavailable_components=unavailable, detail=detail)
+            save_plan_version(plan)
+        latest_incident.status = IncidentStatus.ACTIVE
+        latest_incident.updated_at = datetime.utcnow()
+        _append_incident_log(
+            latest_incident,
+            source="system",
+            category="enrichment_error",
+            message=str(exc)[:280],
+        )
+        save_incident(latest_incident)
+
+
+def _sync_incident_state_from_plan(incident: Incident, plan: PlanVersion) -> None:
+    flow = plan.patient_flow
+    medical = plan.medical_impact
+    command = plan.command_recommendations
+    incident.estimated_patients = (
+        flow.total_incoming
+        if flow is not None
+        else (medical.critical + medical.moderate + medical.minor if medical is not None else incident.estimated_patients)
+    )
+    if flow is not None:
+        incident.triage_counts = TriageCounts(
+            critical=flow.critical,
+            moderate=flow.moderate,
+            minor=flow.minor,
+        )
+    elif medical is not None:
+        incident.triage_counts = TriageCounts(
+            critical=medical.critical,
+            moderate=medical.moderate,
+            minor=medical.minor,
+        )
+
+    if plan.command_transfer_summary and plan.command_transfer_summary.top_hazards:
+        incident.hazards = plan.command_transfer_summary.top_hazards[:4]
+    elif not incident.hazards:
+        incident.hazards = plan.risk_notes[:4]
+
+    constraints = []
+    if flow is not None:
+        constraints.extend(flow.bottlenecks)
+    if plan.patient_transport is not None:
+        constraints.extend(plan.patient_transport.constraints)
+    incident.access_constraints = list(dict.fromkeys(constraints))[:4]
+    incident.operational_objectives = plan.incident_objectives[:4]
+    incident.current_bottlenecks = list(dict.fromkeys((flow.bottlenecks if flow else []) + plan.risk_notes))[:5]
+
+    if command is not None:
+        incident.command_mode = command.command_mode or incident.command_mode
+        incident.command_post_established = command.command_post_established
+        incident.unified_command = command.unified_command_recommended
+        incident.safety_officer_assigned = command.safety_officer_recommended
+        incident.staging_area = command.staging_area or incident.staging_area
+        incident.transport_group_active = command.transport_group_active
+    incident.ics_organization = list(plan.ics_organization or [])
+
+    assigned = []
+    staged = []
+    requested = []
+    out_of_service = []
+    for resource in incident.resources:
+        status = (resource.deployment_status or "").lower()
+        if status == "assigned":
+            assigned.append(resource.name)
+        elif status == "staged":
+            staged.append(resource.name)
+        elif status == "requested":
+            requested.append(resource.name)
+        elif status in {"unavailable", "out_of_service"} or not resource.available:
+            out_of_service.append(resource.name)
+    incident.assigned_resources = assigned[:8]
+    incident.staged_resources = staged[:8]
+    incident.requested_resources = requested[:8]
+    incident.out_of_service_resources = out_of_service[:8]
+
+
 @router.get("/health")
 async def health():
-    return {"status": "ok", "service": "unilert"}
+    return {"status": "ok", "service": "unilert-api"}
+
+
+@router.get("/ready")
+async def ready():
+    report = await build_readiness_report()
+    status_code = 200 if report["status"] != "not_ready" else 503
+    return JSONResponse(status_code=status_code, content=report)
 
 
 # --- Incidents ---
@@ -88,6 +250,13 @@ async def health():
 @router.post("/incidents", response_model=Incident)
 async def create_incident(body: IncidentCreate):
     incident = Incident(**body.model_dump())
+    if incident.report:
+        _append_incident_log(
+            incident,
+            source="dispatch",
+            category="initial_report",
+            message=incident.report[:280],
+        )
     save_incident(incident)
     return incident
 
@@ -105,10 +274,25 @@ async def get_incident_detail(incident_id: str):
     return incident
 
 
+@router.get("/incidents/{incident_id}/live", response_model=LiveIncidentResponse)
+async def get_incident_live(incident_id: str):
+    incident = get_incident(incident_id)
+    if not incident:
+        raise HTTPException(404, "Incident not found")
+    plan = get_latest_plan(incident_id)
+    version = plan.version if plan is not None else (incident.current_plan_version or None)
+    runs = list_agent_runs(incident_id, version) if version else []
+    return LiveIncidentResponse(
+        incident=incident,
+        plan=plan,
+        agent_runs=runs,
+    )
+
+
 # --- Analysis / Plan Generation ---
 
 @router.post("/incidents/{incident_id}/analyze", response_model=AnalysisResponse)
-async def analyze_incident(incident_id: str):
+async def analyze_incident(incident_id: str, background_tasks: BackgroundTasks):
     incident = get_incident(incident_id)
     if not incident:
         raise HTTPException(404, "Incident not found")
@@ -117,26 +301,31 @@ async def analyze_incident(incident_id: str):
 
     incident.status = IncidentStatus.ANALYZING
     incident.updated_at = datetime.utcnow()
+    _append_incident_log(incident, source="system", category="analysis", message="Initial analysis started")
     save_incident(incident)
 
     try:
         version = incident.current_plan_version + 1
-        plan, runs = await generate_plan(incident, version)
+        plan = await generate_initial_plan(incident, version)
 
         incident.current_plan_version = version
         incident.status = IncidentStatus.ACTIVE
         incident.updated_at = datetime.utcnow()
+        _sync_incident_state_from_plan(incident, plan)
+        _append_incident_log(incident, source="system", category="analysis", message=f"Plan v{version} activated (local-first)")
         save_incident(incident)
         save_plan_version(plan)
+        background_tasks.add_task(_complete_enrichment_for_version, incident.id, version)
 
         return AnalysisResponse(
             incident=incident,
             plan=plan,
-            agent_runs=runs,
-            agent_failures=collect_agent_failures(runs),
+            agent_runs=[],
+            agent_failures=[],
         )
     except Exception as e:
         incident.status = IncidentStatus.PENDING
+        _append_incident_log(incident, source="system", category="analysis_error", message=str(e)[:280])
         save_incident(incident)
         detail = _augment_runtime_error_message(e)
         raise HTTPException(_http_status_for_runtime_error(e), f"Analysis failed: {detail}")
@@ -145,7 +334,7 @@ async def analyze_incident(incident_id: str):
 # --- Replanning ---
 
 @router.post("/incidents/{incident_id}/replan", response_model=ReplanResponse)
-async def replan_incident(incident_id: str, body: IncidentUpdate):
+async def replan_incident(incident_id: str, body: IncidentUpdate, background_tasks: BackgroundTasks):
     incident = get_incident(incident_id)
     if not incident:
         raise HTTPException(404, "Incident not found")
@@ -158,20 +347,65 @@ async def replan_incident(incident_id: str, body: IncidentUpdate):
 
     if body.updated_resources:
         incident.resources = body.updated_resources
+    if body.hazards is not None:
+        incident.hazards = body.hazards
+    if body.access_constraints is not None:
+        incident.access_constraints = body.access_constraints
+    if body.estimated_patients is not None:
+        incident.estimated_patients = body.estimated_patients
+    if body.triage_counts is not None:
+        incident.triage_counts = body.triage_counts
+    if body.command_mode is not None:
+        incident.command_mode = body.command_mode
+    if body.command_post_established is not None:
+        incident.command_post_established = body.command_post_established
+    if body.unified_command is not None:
+        incident.unified_command = body.unified_command
+    if body.safety_officer_assigned is not None:
+        incident.safety_officer_assigned = body.safety_officer_assigned
+    if body.ics_organization is not None:
+        incident.ics_organization = body.ics_organization
+    if body.staging_area is not None:
+        incident.staging_area = body.staging_area
+    if body.operational_objectives is not None:
+        incident.operational_objectives = body.operational_objectives
+    if body.assigned_resources is not None:
+        incident.assigned_resources = body.assigned_resources
+    if body.staged_resources is not None:
+        incident.staged_resources = body.staged_resources
+    if body.requested_resources is not None:
+        incident.requested_resources = body.requested_resources
+    if body.out_of_service_resources is not None:
+        incident.out_of_service_resources = body.out_of_service_resources
+    if body.transport_group_active is not None:
+        incident.transport_group_active = body.transport_group_active
+    if body.current_bottlenecks is not None:
+        incident.current_bottlenecks = body.current_bottlenecks
+    if body.updated_hospital_capacities:
+        incident.hospital_capacities = body.updated_hospital_capacities
 
     incident.status = IncidentStatus.REPLANNING
     incident.updated_at = datetime.utcnow()
+    _append_incident_log(
+        incident,
+        source=body.log_source or "field",
+        category="field_update",
+        message=body.update_text[:280],
+    )
     save_incident(incident)
 
     try:
         version = incident.current_plan_version + 1
-        new_plan, runs = await generate_plan(incident, version, update_text=body.update_text, previous_plan=previous_plan)
+        new_plan = await generate_initial_plan(incident, version, body.update_text, previous_plan)
 
         incident.current_plan_version = version
         incident.status = IncidentStatus.ACTIVE
         incident.updated_at = datetime.utcnow()
+        _sync_incident_state_from_plan(incident, new_plan)
+        _append_incident_log(incident, source="system", category="replan", message=f"Plan v{version} activated after update (local-first)")
         save_incident(incident)
         save_plan_version(new_plan)
+        background_tasks.add_task(_complete_enrichment_for_version, incident.id, version, update_text=body.update_text)
 
         diff = _generate_diff(previous_plan, new_plan)
 
@@ -179,11 +413,12 @@ async def replan_incident(incident_id: str, body: IncidentUpdate):
             incident=incident,
             plan=new_plan,
             diff=diff,
-            agent_runs=runs,
-            agent_failures=collect_agent_failures(runs),
+            agent_runs=[],
+            agent_failures=[],
         )
     except Exception as e:
         incident.status = IncidentStatus.ACTIVE
+        _append_incident_log(incident, source="system", category="replan_error", message=str(e)[:280])
         save_incident(incident)
         detail = _augment_runtime_error_message(e)
         raise HTTPException(_http_status_for_runtime_error(e), f"Replanning failed: {detail}")

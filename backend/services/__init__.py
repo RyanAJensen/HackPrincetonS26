@@ -1,47 +1,27 @@
 """
-External data services. Each service is independently failable —
-agents receive whatever data is available and degrade gracefully.
+External and deterministic services.
+
+These modules are kept as explicit service boundaries so they can be split into
+containers later without rewriting the orchestrator contract.
 """
-import asyncio
-from typing import Optional
 
-from services.mapping_service import get_location_context
+from services.context_ingestion_service import gather_external_context
+from services.context_ingestion_service import gather_immediate_context
+from services.decision_engine import build_decision_state, validate_decision_state
+from services.deployment_status import build_readiness_report
+from services.hospital_directory_service import get_hospital_directory_context
+from services.routing_service import get_route_context
+from services.usgs_service import get_water_context
 from services.weather_service import get_weather_context
-from services.fema_service import get_nj_hazard_context
 
-# Princeton, NJ fallback coordinates when geocoding fails
-PRINCETON_LAT = 40.3573
-PRINCETON_LON = -74.6672
-
-
-async def gather_external_context(location: str) -> dict:
-    """
-    Run all three services concurrently. Returns a unified enrichment dict
-    consumed by the agent pipeline. Any service failure returns empty data,
-    never raises.
-    """
-    mapping_task = get_location_context(location)
-    fema_task = get_nj_hazard_context()
-
-    mapping, fema = await asyncio.gather(mapping_task, fema_task, return_exceptions=True)
-
-    if isinstance(mapping, Exception):
-        mapping = {"available": False, "geocode": None, "routing": None}
-    if isinstance(fema, Exception):
-        fema = {"available": False, "declarations": [], "context_notes": []}
-
-    # Use geocoded coordinates for weather, fall back to Princeton center
-    geo = (mapping or {}).get("geocode") or {}
-    lat = geo.get("lat") or PRINCETON_LAT
-    lon = geo.get("lon") or PRINCETON_LON
-
-    weather = await get_weather_context(lat, lon)
-    if isinstance(weather, Exception):
-        weather = {"available": False, "alerts": [], "forecast": None, "risk": {}}
-
-    return {
-        "mapping": mapping,
-        "weather": weather,
-        "fema": fema,
-        "coordinates": {"lat": lat, "lon": lon},
-    }
+__all__ = [
+    "build_decision_state",
+    "build_readiness_report",
+    "gather_external_context",
+    "gather_immediate_context",
+    "get_hospital_directory_context",
+    "get_route_context",
+    "get_water_context",
+    "get_weather_context",
+    "validate_decision_state",
+]

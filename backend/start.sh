@@ -1,5 +1,24 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
-source .env 2>/dev/null || true
-venv/Scripts/python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  if [ -x "../.venv/bin/python" ]; then
+    PYTHON_BIN="../.venv/bin/python"
+  elif [ -x ".venv/bin/python" ]; then
+    PYTHON_BIN=".venv/bin/python"
+  elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    PYTHON_BIN="$VIRTUAL_ENV/bin/python"
+  else
+    PYTHON_BIN="python3"
+  fi
+fi
+
+exec "$PYTHON_BIN" -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}" --reload

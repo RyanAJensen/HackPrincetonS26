@@ -186,6 +186,56 @@ def _fmt_planner_risk_context(risk_data: dict | str) -> str:
     return "\n".join(field for field in fields if not field.endswith(": "))
 
 
+def _fmt_decision_state(decision_state: dict | None, *, compact: bool) -> str:
+    if not decision_state:
+        return "Decision state unavailable."
+    counts = decision_state.get("counts") or {}
+    flow = decision_state.get("patient_flow") or {}
+    assignments = flow.get("facility_assignments") or []
+    risk = decision_state.get("risk") or {}
+    assignment_bits = []
+    for item in assignments[: (2 if compact else 3)]:
+        if not isinstance(item, dict):
+            continue
+        mix = "/".join(item.get("patient_types") or []) or "mixed"
+        assignment_bits.append(f"{item.get('hospital', '?')}={item.get('patients_assigned', 0)} ({mix})")
+    lines = [
+        (
+            f"Patients: total={counts.get('total', flow.get('total_incoming', 0))} "
+            f"critical={counts.get('critical', flow.get('critical', 0))} "
+            f"moderate={counts.get('moderate', flow.get('moderate', 0))} "
+            f"minor={counts.get('minor', flow.get('minor', 0))}"
+        ),
+        f"Primary route: {decision_state.get('primary_access_route', 'unknown')}",
+        f"Alternate route: {decision_state.get('alternate_access_route', 'unknown')}",
+        "Allocation: " + ("; ".join(assignment_bits) if assignment_bits else "pending"),
+        "Operational priorities: " + "; ".join((decision_state.get("operational_priorities") or [])[:3]),
+        "Bottlenecks: " + "; ".join((flow.get("bottlenecks") or risk.get("capacity_bottlenecks") or [])[: (2 if compact else 4)]),
+    ]
+    if not compact:
+        lines.append(
+            "Transport constraints: "
+            + "; ".join(((decision_state.get("patient_transport") or {}).get("constraints") or [])[:3])
+        )
+    return "\n".join(line for line in lines if not line.endswith(": "))
+
+
+def _fmt_computed_risk(risk_data: dict | str, *, compact: bool) -> str:
+    if isinstance(risk_data, str):
+        return risk_data
+    if not risk_data:
+        return "Computed risk unavailable."
+    fields = [
+        f"Severity: {risk_data.get('severity_level', 'unknown')}",
+        "Primary risks: " + "; ".join((risk_data.get("primary_risks") or [])[: (2 if compact else 4)]),
+        "Capacity bottlenecks: " + "; ".join((risk_data.get("capacity_bottlenecks") or [])[: (2 if compact else 3)]),
+        "Transport delays: " + "; ".join((risk_data.get("transport_delays") or [])[:2]),
+        "Cascade risks: " + "; ".join((risk_data.get("cascade_risks") or [])[:2]),
+        "Replan triggers: " + "; ".join((risk_data.get("replan_triggers") or [])[: (2 if compact else 4)]),
+    ]
+    return "\n".join(field for field in fields if not field.endswith(": "))
+
+
 def _fmt_route(routing: dict | None) -> tuple[str, str, str]:
     """Returns (primary_route, route_duration, alternate_note)."""
     if not routing:
@@ -264,7 +314,8 @@ async def run_risk_assessor(run: AgentRun) -> dict:
     alerts = weather.get("alerts", [])
     risk = weather.get("risk", {})
     prompt = RISK_ASSESSOR_PROMPT.format(
-        parsed_data=json.dumps(inp["parsed_data"], indent=2),
+        decision_state=_fmt_decision_state(inp.get("decision_state", {}), compact=False),
+        computed_risk=_fmt_computed_risk(inp.get("risk_data", {}), compact=False),
         resources=_fmt_resources(inp.get("resources", [])),
         alert_count=len(alerts),
         weather_alerts=_fmt_alerts(alerts),
@@ -288,7 +339,8 @@ async def run_risk_assessor_reduced(run: AgentRun) -> dict:
     alerts = weather.get("alerts", [])
     risk = weather.get("risk", {})
     prompt = RISK_ASSESSOR_REDUCED_PROMPT.format(
-        parsed_data=json.dumps(inp["parsed_data"], indent=2),
+        decision_state=_fmt_decision_state(inp.get("decision_state", {}), compact=True),
+        computed_risk=_fmt_computed_risk(inp.get("risk_data", {}), compact=True),
         resources=_fmt_resources(inp.get("resources", [])),
         alert_count=len(alerts),
         weather_alerts=_fmt_alerts(alerts),
@@ -316,7 +368,8 @@ async def run_action_planner(run: AgentRun) -> dict:
     risk_context = _fmt_planner_risk_context(inp.get("risk_data", {}))
 
     prompt = ACTION_PLANNER_PROMPT.format(
-        parsed_data=json.dumps(inp["parsed_data"], indent=2),
+        decision_state=_fmt_decision_state(inp.get("decision_state", {}), compact=False),
+        computed_risk=_fmt_computed_risk(inp.get("computed_risk", inp.get("risk_data", {})), compact=False),
         risk_data=risk_context,
         resources=_fmt_resources(inp.get("resources", [])),
         location=inp["location"],
@@ -344,8 +397,9 @@ async def run_action_planner_reduced(run: AgentRun) -> dict:
     primary_route, route_duration, alternate_note = _fmt_route(routing)
 
     prompt = ACTION_PLANNER_REDUCED_PROMPT.format(
-        parsed_data=json.dumps(inp["parsed_data"], indent=2),
+        decision_state=_fmt_decision_state(inp.get("decision_state", {}), compact=True),
         risk_data=_fmt_planner_risk_context(inp.get("risk_data", {})),
+        computed_risk=_fmt_computed_risk(inp.get("computed_risk", inp.get("risk_data", {})), compact=True),
         resources=_fmt_resources(inp.get("resources", [])),
         location=inp["location"],
         primary_route=primary_route,
@@ -517,8 +571,12 @@ def _log_prompt_stats(run: "AgentRun", prompt: str, model: str) -> None:
 
 # ─── Lean agent functions ──────────────────────────────────────────────────────
 
-_LEAN_TIMEOUT = float(os.environ.get("LEAN_AGENT_TIMEOUT_SECONDS", "90"))
-_LEAN_FALLBACK_TIMEOUT = float(os.environ.get("LEAN_FALLBACK_TIMEOUT_SECONDS", "45"))
+_LEAN_TIMEOUT = float(os.environ.get("LEAN_AGENT_TIMEOUT_SECONDS", "35"))
+_LEAN_PARSER_TIMEOUT = float(os.environ.get("LEAN_PARSER_TIMEOUT_SECONDS", str(_LEAN_TIMEOUT)))
+_LEAN_RISK_TIMEOUT = float(os.environ.get("LEAN_RISK_TIMEOUT_SECONDS", "35"))
+_LEAN_PLANNER_TIMEOUT = float(os.environ.get("LEAN_PLANNER_TIMEOUT_SECONDS", "45"))
+_LEAN_COMMS_TIMEOUT = float(os.environ.get("LEAN_COMMS_TIMEOUT_SECONDS", "25"))
+_LEAN_FALLBACK_TIMEOUT = float(os.environ.get("LEAN_FALLBACK_TIMEOUT_SECONDS", "20"))
 
 
 async def run_lean_parser(run: AgentRun) -> dict:
@@ -533,38 +591,65 @@ async def run_lean_parser(run: AgentRun) -> dict:
     )
     _log_prompt_stats(run, prompt, "K2-Think-v2")
     run.log_entries.append("lean situation parser")
-    return await call_llm(prompt, caller="incident_parser", response_model=LeanParserOutput, timeout_seconds=_LEAN_TIMEOUT)
+    return await call_llm(
+        prompt,
+        caller="incident_parser",
+        response_model=LeanParserOutput,
+        timeout_seconds=_LEAN_PARSER_TIMEOUT,
+    )
 
 
 async def run_lean_risk(run: AgentRun) -> dict:
     inp = run.input_snapshot
+    decision_state_text = inp.get("decision_state_compact") or _fmt_decision_state(inp.get("decision_state", {}), compact=True)
     prompt = LEAN_RISK_PROMPT.format(
-        situation_summary=_fmt_situation_compact(inp.get("parsed_data", {})),
+        decision_state=decision_state_text,
     )
     _log_prompt_stats(run, prompt, "K2-Think-v2")
     run.log_entries.append("lean risk assessor")
-    return await call_llm(prompt, caller="risk_assessor", response_model=LeanRiskOutput, timeout_seconds=_LEAN_TIMEOUT)
+    return await call_llm(
+        prompt,
+        caller="risk_assessor",
+        response_model=LeanRiskOutput,
+        timeout_seconds=_LEAN_RISK_TIMEOUT,
+    )
 
 
 async def run_lean_planner(run: AgentRun) -> dict:
     inp = run.input_snapshot
-    ext = inp.get("external_context", {})
-    mapping = ext.get("mapping", {})
-    routing = mapping.get("routing")
-    hospitals = mapping.get("hospitals")
-    primary_route, route_duration, alternate_note = _fmt_route(routing)
+    decision_state_text = inp.get("decision_state_compact") or _fmt_decision_state(inp.get("decision_state", {}), compact=True)
+    risk_summary = inp.get("risk_summary_compact") or _fmt_risk_compact(inp.get("risk_data", {}))
+    primary_route = inp.get("primary_route")
+    route_duration = inp.get("route_duration")
+    alternate_note = inp.get("alternate_route_note")
+    hospital_context = inp.get("hospital_context")
+    hospital_capacity_summary = inp.get("hospital_capacity_summary")
+    if not primary_route or not route_duration or not alternate_note:
+        ext = inp.get("external_context", {})
+        mapping = ext.get("mapping", {})
+        routing = mapping.get("routing")
+        hospitals = mapping.get("hospitals")
+        primary_route, route_duration, alternate_note = _fmt_route(routing)
+        hospital_context = hospital_context or _fmt_hospitals(hospitals)
+    hospital_context = hospital_context or "No hospital data available"
+    hospital_capacity_summary = hospital_capacity_summary or _fmt_hospital_capacities(inp.get("hospital_capacities", []))
     prompt = LEAN_PLANNER_PROMPT.format(
-        situation_summary=_fmt_situation_compact(inp.get("parsed_data", {})),
-        risk_summary=_fmt_risk_compact(inp.get("risk_data", {})),
+        decision_state=decision_state_text,
+        risk_summary=risk_summary,
         primary_route=primary_route,
         route_duration=route_duration,
         alternate_route_note=alternate_note,
-        hospital_context=_fmt_hospitals(hospitals),
-        hospital_capacity_summary=_fmt_hospital_capacities(inp.get("hospital_capacities", [])),
+        hospital_context=hospital_context,
+        hospital_capacity_summary=hospital_capacity_summary,
     )
     _log_prompt_stats(run, prompt, "K2-Think-v2")
     run.log_entries.append("lean operations planner")
-    return await call_llm(prompt, caller="action_planner", response_model=LeanPlannerOutput, timeout_seconds=_LEAN_TIMEOUT)
+    return await call_llm(
+        prompt,
+        caller="action_planner",
+        response_model=LeanPlannerOutput,
+        timeout_seconds=_LEAN_PLANNER_TIMEOUT,
+    )
 
 
 async def run_coordination_engine(run: AgentRun) -> dict:
@@ -588,23 +673,31 @@ async def run_coordination_engine(run: AgentRun) -> dict:
     )
     _log_prompt_stats(run, prompt, "K2-Think-v2")
     run.log_entries.append("fast mode coordination engine (situation+risk+plan combined)")
-    return await call_llm(prompt, caller="action_planner", response_model=LeanCoordinationOutput, timeout_seconds=_LEAN_TIMEOUT)
+    return await call_llm(
+        prompt,
+        caller="action_planner",
+        response_model=LeanCoordinationOutput,
+        timeout_seconds=_LEAN_PLANNER_TIMEOUT,
+    )
 
 
 async def run_lean_comms(run: AgentRun) -> dict:
     inp = run.input_snapshot
-    plan = inp.get("plan_data", {})
-    facilities = plan.get("facility_assignments", [])
-    patient_summary = (
-        f"total={plan.get('total_patients', 0)} "
-        f"critical={plan.get('critical', 0)} "
-        f"moderate={plan.get('moderate', 0)} "
-        f"minor={plan.get('minor', 0)}"
-    )
-    if facilities:
-        hosp_lines = "; ".join(f"{f.get('hospital', '?')}:{f.get('patients', f.get('patients_assigned', 0))}" for f in facilities[:3])
-        patient_summary += f" → {hosp_lines}"
-    priorities = "; ".join((plan.get("priorities") or plan.get("operational_priorities") or [])[:3])
+    patient_summary = inp.get("patient_summary")
+    priorities = inp.get("priorities_text")
+    if not patient_summary or not priorities:
+        plan = inp.get("plan_data", {})
+        facilities = plan.get("facility_assignments", [])
+        patient_summary = (
+            f"total={plan.get('total_patients', 0)} "
+            f"critical={plan.get('critical', 0)} "
+            f"moderate={plan.get('moderate', 0)} "
+            f"minor={plan.get('minor', 0)}"
+        )
+        if facilities:
+            hosp_lines = "; ".join(f"{f.get('hospital', '?')}:{f.get('patients', f.get('patients_assigned', 0))}" for f in facilities[:3])
+            patient_summary += f" → {hosp_lines}"
+        priorities = "; ".join((plan.get("priorities") or plan.get("operational_priorities") or [])[:3])
     prompt = LEAN_COMMS_PROMPT.format(
         situation_summary=inp.get("situation_summary", inp.get("incident_summary", "Surge event")),
         severity=inp.get("severity", "high"),
@@ -614,4 +707,9 @@ async def run_lean_comms(run: AgentRun) -> dict:
     )
     _log_prompt_stats(run, prompt, "K2-Think-v2")
     run.log_entries.append("lean communications agent")
-    return await call_llm(prompt, caller="communications", response_model=LeanCommunicationsOutput, timeout_seconds=_LEAN_TIMEOUT)
+    return await call_llm(
+        prompt,
+        caller="communications",
+        response_model=LeanCommunicationsOutput,
+        timeout_seconds=_LEAN_COMMS_TIMEOUT,
+    )

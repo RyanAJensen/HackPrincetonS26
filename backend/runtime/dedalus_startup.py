@@ -146,7 +146,7 @@ def run_startup_dedalus_checks() -> dict[str, Any]:
     if runtime_mode == "dedalus" and not ok:
         print(
             "  [Dedalus verify] WARNING: RUNTIME_MODE=dedalus but dedalus_labs SDK import failed — "
-            "agents will fall back to K2 unless DEDALUS_STRICT is enabled (then startup fails).",
+            "runtime initialization will fail unless ALLOW_RUNTIME_FALLBACK_TO_LOCAL=1 is enabled.",
             file=sys.stderr,
         )
 

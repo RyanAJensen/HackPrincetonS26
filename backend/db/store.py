@@ -4,6 +4,7 @@ Organized so Postgres could replace the persistence layer without touching busin
 """
 from __future__ import annotations
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -13,12 +14,29 @@ from models.incident import Incident
 from models.plan import PlanVersion
 from models.agent import AgentRun
 
-DB_PATH = Path(__file__).parent / "sentinel.db"
+DEFAULT_DB_PATH = Path(__file__).parent / "sentinel.db"
+
+
+def get_db_path() -> Path:
+    raw = os.getenv("DB_PATH", "").strip()
+    path = Path(raw).expanduser() if raw else DEFAULT_DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _sqlite_timeout_seconds() -> float:
+    try:
+        return float(os.getenv("SQLITE_TIMEOUT_SECONDS", "30"))
+    except ValueError:
+        return 30.0
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(), timeout=_sqlite_timeout_seconds())
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -65,6 +83,25 @@ def init_db():
             )
         """)
         conn.commit()
+
+
+def probe_db() -> dict[str, object]:
+    path = get_db_path()
+    try:
+        with _get_conn() as conn:
+            conn.execute("SELECT 1").fetchone()
+        return {
+            "status": "ok",
+            "path": str(path),
+            "persistent": bool(os.getenv("DB_PATH")),
+        }
+    except Exception as exc:
+        return {
+            "status": "broken",
+            "path": str(path),
+            "persistent": bool(os.getenv("DB_PATH")),
+            "error": str(exc),
+        }
 
 
 # --- Incident Machines (Dedalus persistent machine registry) ---
@@ -157,6 +194,10 @@ def list_incidents() -> list[Incident]:
 
 def save_plan_version(plan: PlanVersion):
     with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM plan_versions WHERE incident_id=? AND version=?",
+            (plan.incident_id, plan.version),
+        )
         conn.execute(
             "INSERT OR REPLACE INTO plan_versions (id, incident_id, version, data, created_at) VALUES (?, ?, ?, ?, ?)",
             (plan.id, plan.incident_id, plan.version, plan.model_dump_json(), plan.created_at.isoformat())

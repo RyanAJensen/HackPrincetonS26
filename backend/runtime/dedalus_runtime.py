@@ -54,6 +54,10 @@ _shared_client: Any = None
 _shared_runner: Any = None
 
 
+def _allow_runtime_fallback() -> bool:
+    return os.getenv("ALLOW_RUNTIME_FALLBACK_TO_LOCAL", "").lower() in ("1", "true", "yes")
+
+
 def get_shared_dedalus_runner() -> Any | None:
     """
     Lazy singleton for replan / call_llm when outside AgentRuntime.execute.
@@ -143,7 +147,7 @@ class DedalusAgentRuntime(AgentRuntime):
         except Exception as e:
             err_str = str(e)
             is_auth = "401" in err_str or "invalid_api_key" in err_str or "Key inactive" in err_str
-            if is_auth:
+            if is_auth and _allow_runtime_fallback():
                 from agents.dedalus_context import mark_dedalus_auth_failed
                 mark_dedalus_auth_failed()
                 print(f"[Dedalus] Auth error on {run.agent_type} — falling back to local K2")

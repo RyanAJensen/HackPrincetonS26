@@ -16,6 +16,7 @@ class DedalusMachineExecutor(Protocol):
         system: str,
         caller: str,
         response_model: type[BaseModel] | None = None,
+        timeout_seconds: float | None = None,
     ) -> str:
         """Execute one prompt on a specific Dedalus Machine and return stdout."""
 
