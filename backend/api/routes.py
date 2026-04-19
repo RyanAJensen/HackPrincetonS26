@@ -1,15 +1,15 @@
 from __future__ import annotations
 from datetime import datetime
+import inspect
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import Optional, Any
 
 from models.incident import Incident, IncidentCreate, IncidentUpdate, IncidentStatus
 from models.plan import PlanVersion, PlanDiff
-from models.agent import AgentRun
-from agents.orchestrator import generate_plan, _generate_diff
+from models.agent import AgentFailure, AgentRun, AgentType
+from agents.orchestrator import _generate_diff, collect_agent_failures, generate_plan
 from agents.specialist_agents import run_incident_parser
-from models.agent import AgentRun, AgentType
 from db import (
     save_incident, get_incident, list_incidents,
     save_plan_version, get_plan_version, get_latest_plan, list_plan_versions,
@@ -17,14 +17,53 @@ from db import (
 )
 from data.seed import DEMO_SCENARIOS, CAMPUS_RESOURCES
 from runtime import get_runtime
+from runtime.dedalus_client_config import dedalus_byok_configured
+from runtime.dedalus_output import extract_final_output, validate_response_output
 
 router = APIRouter()
+
+
+def _http_status_for_runtime_error(exc: Exception) -> int:
+    msg = str(exc)
+    if "insufficient_balance" in msg or "Error code: 402" in msg:
+        return 402
+    if any(
+        token in msg
+        for token in (
+            "Dedalus runtime requested",
+            "Dedalus Machines runtime requested",
+            "Dedalus Machines API",
+            "DEDALUS_API_KEY",
+            "dedalus_labs",
+            "DedalusRunner(client)",
+            "no DedalusRunner is available",
+        )
+    ):
+        return 503
+    return 500
+
+
+def _augment_runtime_error_message(exc: Exception) -> str:
+    msg = str(exc)
+    if "insufficient_balance" in msg or "Error code: 402" in msg:
+        if dedalus_byok_configured():
+            return (
+                f"{msg}. Dedalus routing reached a 402 even with BYOK configured; "
+                "verify the upstream provider key and provider account balance."
+            )
+        return (
+            f"{msg}. Dedalus Machine credits do not cover default DedalusRunner model calls. "
+            "Add Dedalus API/model credits, or configure BYOK with "
+            "DEDALUS_PROVIDER / DEDALUS_PROVIDER_KEY / DEDALUS_PROVIDER_MODEL."
+        )
+    return msg
 
 
 class AnalysisResponse(BaseModel):
     incident: Incident
     plan: PlanVersion
     agent_runs: list[AgentRun]
+    agent_failures: list[AgentFailure] = Field(default_factory=list)
 
 
 class ReplanResponse(BaseModel):
@@ -32,6 +71,11 @@ class ReplanResponse(BaseModel):
     plan: PlanVersion
     diff: PlanDiff
     agent_runs: list[AgentRun]
+    agent_failures: list[AgentFailure] = Field(default_factory=list)
+
+
+class DebugDedalusSmokeOutput(BaseModel):
+    ok: bool
 
 
 @router.get("/health")
@@ -85,11 +129,17 @@ async def analyze_incident(incident_id: str):
         save_incident(incident)
         save_plan_version(plan)
 
-        return AnalysisResponse(incident=incident, plan=plan, agent_runs=runs)
+        return AnalysisResponse(
+            incident=incident,
+            plan=plan,
+            agent_runs=runs,
+            agent_failures=collect_agent_failures(runs),
+        )
     except Exception as e:
         incident.status = IncidentStatus.PENDING
         save_incident(incident)
-        raise HTTPException(500, f"Analysis failed: {e}")
+        detail = _augment_runtime_error_message(e)
+        raise HTTPException(_http_status_for_runtime_error(e), f"Analysis failed: {detail}")
 
 
 # --- Replanning ---
@@ -125,11 +175,18 @@ async def replan_incident(incident_id: str, body: IncidentUpdate):
 
         diff = _generate_diff(previous_plan, new_plan)
 
-        return ReplanResponse(incident=incident, plan=new_plan, diff=diff, agent_runs=runs)
+        return ReplanResponse(
+            incident=incident,
+            plan=new_plan,
+            diff=diff,
+            agent_runs=runs,
+            agent_failures=collect_agent_failures(runs),
+        )
     except Exception as e:
         incident.status = IncidentStatus.ACTIVE
         save_incident(incident)
-        raise HTTPException(500, f"Replanning failed: {e}")
+        detail = _augment_runtime_error_message(e)
+        raise HTTPException(_http_status_for_runtime_error(e), f"Replanning failed: {detail}")
 
 
 # --- Plan Versions ---
@@ -189,16 +246,42 @@ async def list_campus_resources():
 
 @router.get("/debug/dedalus")
 async def debug_dedalus():
-    """Verify dedalus_labs SDK, API key, and DedalusRunner (no machine API)."""
+    """Verify Dedalus runner or machines connectivity based on runtime mode."""
     import os
     api_key = os.getenv("DEDALUS_API_KEY")
+    runtime_mode = os.getenv("RUNTIME_MODE", "dedalus")
     result: dict = {
         "sdk_available": False,
         "api_key_present": bool(api_key),
-        "runtime": get_runtime().runtime_name(),
+        "runtime": runtime_mode,
         "runner_smoke": None,
+        "machines_smoke": None,
         "error": None,
     }
+
+    if runtime_mode == "swarm":
+        if not api_key:
+            result["error"] = "DEDALUS_API_KEY not set"
+            return result
+        try:
+            from runtime.dedalus_dcs import DedalusMachinesClient
+
+            client = DedalusMachinesClient(api_key)
+            machines = await client.list_machines()
+            result["machines_smoke"] = {
+                "visible_count": len(machines),
+                "machines": [
+                    {
+                        "machine_id": machine.machine_id,
+                        "phase": machine.status.phase if machine.status else "unknown",
+                        "vcpu": machine.vcpu,
+                    }
+                    for machine in machines[:4]
+                ],
+            }
+        except Exception as e:
+            result["error"] = str(e)
+        return result
 
     try:
         from dedalus_labs import AsyncDedalus, DedalusRunner
@@ -214,18 +297,29 @@ async def debug_dedalus():
     try:
         client = AsyncDedalus(api_key=api_key)
         runner = DedalusRunner(client)
+        params = inspect.signature(runner.run).parameters
+        if "response_format" not in params and not any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            raise RuntimeError("DedalusRunner.run does not support response_format for structured outputs")
         # Minimal runner invocation — confirms key + routing (not full agent JSON)
         smoke = await runner.run(
-            input='Reply with exactly: {"ok": true}',
+            input="Reply with ok=true and nothing else.",
             model=os.getenv("DEDALUS_DEBUG_MODEL", "anthropic/claude-sonnet-4-20250514"),
             instructions="You output JSON only.",
             max_steps=2,
             debug=True,
             verbose=True,
+            response_format=DebugDedalusSmokeOutput,
         )
-        out = getattr(smoke, "final_output", None) or str(smoke)
+        out = validate_response_output(
+            extract_final_output(smoke, "debug_dedalus"),
+            DebugDedalusSmokeOutput,
+            "debug_dedalus",
+        )
         result["runner_smoke"] = {
-            "final_output_preview": str(out)[:500],
+            "final_output_preview": out.model_dump(),
+            "final_output_type": type(getattr(smoke, "final_output", None)).__name__,
             "steps_used": getattr(smoke, "steps_used", None),
         }
     except Exception as e:

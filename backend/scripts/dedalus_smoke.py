@@ -12,11 +12,23 @@ Env: DEDALUS_API_KEY in environment or backend/.env
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import sys
+import warnings
 from pathlib import Path
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from pydantic import BaseModel
+
+from runtime.dedalus_output import extract_final_output, validate_response_output
+
+class SmokeResponse(BaseModel):
+    smoke_ok: bool
+    note: str
 
 
 def _load_env() -> None:
@@ -59,19 +71,35 @@ async def main() -> int:
         runner = DedalusRunner(client)
         print("[smoke] AsyncDedalus + DedalusRunner constructed OK")
 
+        warnings.filterwarnings(
+            "error",
+            category=RuntimeWarning,
+            message=r".*was never awaited.*",
+        )
+
         result = await runner.run(
-            input='Reply with exactly this JSON and nothing else: {"smoke_ok": true, "note": "dedalus_smoke"}',
+            input="Return smoke_ok=true and note=dedalus_smoke.",
             model=model,
-            instructions="You output JSON only. No markdown.",
+            instructions="Return the structured response only. No markdown.",
             max_steps=3,
             debug=True,
             verbose=True,
+            response_format=SmokeResponse,
         )
-        raw = getattr(result, "final_output", None) or str(result)
-        print("[smoke] --- raw result ---")
-        print(raw)
-        print("[smoke] --- end raw ---")
+        structured = validate_response_output(
+            extract_final_output(result, "dedalus_smoke"),
+            SmokeResponse,
+            "dedalus_smoke",
+        )
+        print("[smoke] awaited runner.run successfully")
+        print(f"[smoke] final_output_type={type(getattr(result, 'final_output', None)).__name__}")
+        print("[smoke] final_output:")
+        print(structured.model_dump_json(indent=2))
         print(f"[smoke] steps_used={getattr(result, 'steps_used', None)}")
+        del structured
+        del result
+        gc.collect()
+        print("[smoke] no coroutine warnings detected")
         print("[smoke] SUCCESS")
         return 0
     except Exception as e:

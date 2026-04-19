@@ -1,47 +1,210 @@
-"""LLM calls: DedalusRunner when configured, else K2 Think API — JSON-only responses."""
+"""Strict JSON LLM wrapper with schema validation, bounded retries, and safe logs."""
 from __future__ import annotations
+
 import inspect
 import json
 import os
-import re
 import time
+from dataclasses import dataclass
+from threading import Lock
+from typing import Any, Optional
+
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from agents.dedalus_context import dedalus_runner_ctx
+from agents.machine_context import dedalus_machine_executor_ctx, dedalus_machine_id_ctx
+from runtime.dedalus_output import (
+    DedalusOutputError,
+    DedalusOutputValidationError,
+    extract_final_output,
+    validate_response_output,
+)
 
 K2_API_URL = "https://api.k2think.ai/v1/chat/completions"
 K2_MODEL = "MBZUAI-IFM/K2-Think-v2"
+MAX_VALIDATION_RETRIES = 2
 
-_api_key: str | None = None
-
+STRICT_JSON_DIRECTIVE = (
+    "Do not include any explanation, reasoning, chain-of-thought, or preamble. "
+    "Output ONLY valid JSON that matches the response schema exactly."
+)
 DEFAULT_JSON_SYSTEM = (
     "You are an emergency medical coordination specialist. "
-    "Your entire reply MUST be a single raw JSON object only. "
-    "No markdown, no code fences, no explanations, no text before or after the JSON. "
-    "Start with { and end with }. "
-    "Be concise: string values under 120 characters, lists under 8 items."
+    f"{STRICT_JSON_DIRECTIVE}"
 )
 
-_RAW_LOG_MAX = 8000
+_api_key: Optional[str] = None
+
+
+class LLMResponseValidationError(RuntimeError):
+    """Raised when model output is not strict JSON or fails schema validation."""
+
+
+class LLMStructuredError(RuntimeError):
+    """Structured terminal error for the LLM pipeline."""
+
+    def __init__(
+        self,
+        *,
+        caller: str,
+        source: str,
+        kind: str,
+        retry_count: int,
+        detail: str,
+    ) -> None:
+        self.caller = caller
+        self.source = source
+        self.kind = kind
+        self.retry_count = retry_count
+        self.detail = detail
+        super().__init__(
+            f"{caller}: {detail} "
+            f"(source={source}, kind={kind}, retry_count={retry_count})"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "caller": self.caller,
+            "source": self.source,
+            "kind": self.kind,
+            "retry_count": self.retry_count,
+            "detail": self.detail,
+        }
+
+
+@dataclass
+class ReliabilityStats:
+    total_calls: int = 0
+    successful_calls: int = 0
+    first_pass_successes: int = 0
+    retried_calls: int = 0
+    total_latency_ms: int = 0
+
+    def snapshot(self) -> dict[str, float | int]:
+        total = self.total_calls or 1
+        return {
+            "total_calls": self.total_calls,
+            "successful_calls": self.successful_calls,
+            "first_pass_success_rate": self.first_pass_successes / total,
+            "avg_latency": self.total_latency_ms / total,
+            "retry_rate": self.retried_calls / total,
+        }
+
+
+_RELIABILITY_LOCK = Lock()
+_RELIABILITY: dict[str, ReliabilityStats] = {}
+
+
+def reset_llm_reliability_tracking() -> None:
+    with _RELIABILITY_LOCK:
+        _RELIABILITY.clear()
+
+
+def get_llm_reliability_snapshot() -> dict[str, dict[str, float | int]]:
+    with _RELIABILITY_LOCK:
+        return {caller: stats.snapshot() for caller, stats in _RELIABILITY.items()}
+
+
+def _record_reliability(
+    caller: str,
+    *,
+    latency_ms: int,
+    retry_count: int,
+    success: bool,
+) -> None:
+    with _RELIABILITY_LOCK:
+        stats = _RELIABILITY.setdefault(caller, ReliabilityStats())
+        stats.total_calls += 1
+        stats.total_latency_ms += latency_ms
+        if success:
+            stats.successful_calls += 1
+            if retry_count == 0:
+                stats.first_pass_successes += 1
+        if retry_count > 0:
+            stats.retried_calls += 1
+
+
+def _log_result(
+    source: str,
+    caller: str,
+    *,
+    latency_ms: int,
+    success: bool,
+    retry_count: int,
+    error_kind: Optional[str] = None,
+) -> None:
+    msg = (
+        f"  [{source}] agent={caller} latency_ms={latency_ms} "
+        f"success={'true' if success else 'false'} retry_count={retry_count}"
+    )
+    if error_kind:
+        msg += f" error={error_kind}"
+    print(msg)
+
+
+def _finalize_success(source: str, caller: str, started_at: float, retry_count: int) -> None:
+    latency_ms = int((time.monotonic() - started_at) * 1000)
+    _record_reliability(caller, latency_ms=latency_ms, retry_count=retry_count, success=True)
+    _log_result(source, caller, latency_ms=latency_ms, success=True, retry_count=retry_count)
+
+
+def _raise_terminal_error(
+    source: str,
+    caller: str,
+    *,
+    started_at: float,
+    retry_count: int,
+    kind: str,
+    exc: Exception,
+) -> None:
+    latency_ms = int((time.monotonic() - started_at) * 1000)
+    _record_reliability(caller, latency_ms=latency_ms, retry_count=retry_count, success=False)
+    _log_result(
+        source,
+        caller,
+        latency_ms=latency_ms,
+        success=False,
+        retry_count=retry_count,
+        error_kind=kind,
+    )
+    raise LLMStructuredError(
+        caller=caller,
+        source=source,
+        kind=kind,
+        retry_count=retry_count,
+        detail=str(exc),
+    ) from exc
 
 
 def get_api_key() -> str:
     global _api_key
     if _api_key is None:
-        _api_key = os.environ.get("K2_API_KEY", "IFM-pB75TfFLX28aXCKQ")
+        _api_key = os.environ.get("K2_API_KEY")
+    if not _api_key:
+        raise RuntimeError(
+            "K2 local runtime requested but K2_API_KEY is not set. "
+            "Set K2_API_KEY in backend/.env or switch RUNTIME_MODE away from local."
+        )
     return _api_key
 
 
+def _require_response_model(
+    response_model: Optional[type[BaseModel]],
+) -> type[BaseModel]:
+    if response_model is None:
+        raise RuntimeError("call_llm requires a response_model for strict structured output")
+    return response_model
+
+
 def _use_dedalus_runner_for_llm() -> bool:
-    if os.getenv("RUNTIME_MODE", "dedalus") == "local":
-        return False
-    return bool(os.getenv("DEDALUS_API_KEY"))
+    return os.getenv("RUNTIME_MODE", "dedalus") != "local"
 
 
-def _get_runner_for_call():
-    r = dedalus_runner_ctx.get()
-    if r is not None:
-        return r
+def _get_runner_for_call() -> Any | None:
+    runner = dedalus_runner_ctx.get()
+    if runner is not None:
+        return runner
     if not _use_dedalus_runner_for_llm():
         return None
     try:
@@ -52,113 +215,132 @@ def _get_runner_for_call():
         return None
 
 
-def _strip_json_text(text: str) -> str:
-    text = text.strip()
-    if "</redacted_thinking>" in text:
-        text = text.split("</redacted_thinking>")[-1].strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```\s*$", "", text, flags=re.IGNORECASE)
-    text = text.strip()
-    # Drop common lead-in lines before first {
-    if "{" in text:
-        idx = text.find("{")
-        if idx > 0:
-            prefix = text[:idx].strip()
-            if prefix and not prefix.startswith("{"):
-                text = text[idx:]
-    return text
+def _get_machine_executor_for_call() -> tuple[Any | None, str | None]:
+    executor = dedalus_machine_executor_ctx.get()
+    machine_id = dedalus_machine_id_ctx.get()
+    if executor is None and machine_id is None:
+        return None, None
+    if executor is None or machine_id is None:
+        raise RuntimeError("Dedalus Machines context is incomplete for call_llm")
+    return executor, machine_id
 
 
-def _extract_first_json_object(text: str) -> str | None:
-    """Find first balanced {...} substring; returns None if not found."""
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
+def _build_system_prompt(system: str) -> str:
+    base = (system or DEFAULT_JSON_SYSTEM).strip()
+    if STRICT_JSON_DIRECTIVE not in base:
+        return f"{base}\n\n{STRICT_JSON_DIRECTIVE}"
+    return base
 
 
-def _parse_json_with_recovery(raw: str, caller: str, source: str) -> dict:
-    """
-    Try json.loads on sanitized text; then first JSON object extraction.
-    Logs raw input on failure (truncated).
-    """
-    if raw is None or not str(raw).strip():
-        print(f"  [{source}] {caller} empty or whitespace-only response")
-        raise RuntimeError(f"{caller}: empty model response — cannot parse JSON")
-
-    attempts: list[tuple[str, str]] = [
-        ("strip+fences", _strip_json_text(raw)),
-        ("first_json_object", ""),
-    ]
-    blob = _strip_json_text(raw)
-    extracted = _extract_first_json_object(blob)
-    if extracted:
-        attempts[1] = ("first_json_object", extracted)
-
-    last_err: Exception | None = None
-    for label, text in attempts:
-        if not text:
-            continue
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as e:
-            last_err = e
-            continue
-
-    preview = raw if len(raw) <= _RAW_LOG_MAX else raw[:_RAW_LOG_MAX] + "\n... [truncated]"
-    print(f"  [{source}] {caller} JSON parse FAILED: {last_err}")
-    print(f"  [{source}] {caller} raw response ({len(raw)} chars):\n{preview}")
-    msg = str(last_err) if last_err else "no JSON object found"
-    raise RuntimeError(f"{caller}: JSON parse failed — {msg}") from last_err
+def _build_json_schema_response_format(
+    response_model: type[BaseModel],
+) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": response_model.__name__,
+            "schema": response_model.model_json_schema(),
+            "strict": True,
+        },
+    }
 
 
-def _k2_extract_message_content(data: dict, caller: str) -> str:
-    """Extract assistant text from K2 OpenAI-style response; log structure if empty."""
+def _strict_json_object(raw: Any, caller: str, source: str) -> dict[str, Any]:
+    text = str(raw).strip() if raw is not None else ""
+    if not text:
+        raise LLMResponseValidationError(f"{caller}: {source} returned an empty response")
     try:
-        choices = data.get("choices")
-        if not choices:
-            print(f"  [LLM/K2] {caller} response has no choices; keys={list(data.keys())}")
-            return ""
-        msg = choices[0].get("message") or {}
-        content = msg.get("content")
-        if content is None:
-            print(f"  [LLM/K2] {caller} message.content is None; message keys={list(msg.keys())}")
-            return ""
-        if isinstance(content, list):
-            # Some APIs return content parts
-            parts = []
-            for p in content:
-                if isinstance(p, dict) and p.get("type") == "text":
-                    parts.append(p.get("text", ""))
-                elif isinstance(p, str):
-                    parts.append(p)
-            return "\n".join(parts).strip()
-        return str(content).strip()
-    except (IndexError, KeyError, TypeError) as e:
-        print(f"  [LLM/K2] {caller} unexpected response shape: {e}; data snippet={str(data)[:500]}")
-        return ""
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise LLMResponseValidationError(
+            f"{caller}: {source} returned non-JSON output: {exc}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise LLMResponseValidationError(f"{caller}: {source} returned non-object JSON")
+    return parsed
+
+
+def _validate_payload(
+    payload: dict[str, Any],
+    response_model: type[BaseModel],
+    caller: str,
+    source: str,
+) -> dict[str, Any]:
+    try:
+        return response_model.model_validate(payload).model_dump()
+    except ValidationError as exc:
+        raise LLMResponseValidationError(
+            f"{caller}: {source} response failed validation against "
+            f"{response_model.__name__}: {exc}"
+        ) from exc
+
+
+def _coerce_response_payload(
+    raw_output: Any,
+    response_model: type[BaseModel],
+    caller: str,
+    source: str,
+) -> dict[str, Any]:
+    if isinstance(raw_output, response_model):
+        return raw_output.model_dump()
+    if isinstance(raw_output, BaseModel):
+        return _validate_payload(raw_output.model_dump(), response_model, caller, source)
+    if isinstance(raw_output, dict):
+        return _validate_payload(raw_output, response_model, caller, source)
+    if isinstance(raw_output, str):
+        return _validate_payload(
+            _strict_json_object(raw_output, caller, source),
+            response_model,
+            caller,
+            source,
+        )
+
+    try:
+        structured = validate_response_output(raw_output, response_model, caller)
+    except DedalusOutputValidationError as exc:
+        raise LLMResponseValidationError(str(exc)) from exc
+    except ValidationError as exc:
+        raise LLMResponseValidationError(
+            f"{caller}: {source} response failed validation against "
+            f"{response_model.__name__}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise LLMResponseValidationError(
+            f"{caller}: {source} returned unsupported output type "
+            f"{type(raw_output).__name__}: {exc}"
+        ) from exc
+    return structured.model_dump()
+
+
+def _extract_k2_message_content(data: dict[str, Any], caller: str) -> str:
+    try:
+        choices = data["choices"]
+        message = choices[0]["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise LLMResponseValidationError(
+            f"{caller}: LLM/K2 response is missing choices/message content"
+        ) from exc
+
+    content = message.get("content")
+    if content is None:
+        raise LLMResponseValidationError(f"{caller}: LLM/K2 response is missing message.content")
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(str(part.get("text", "")))
+            elif isinstance(part, str):
+                text_parts.append(part)
+        return "".join(text_parts).strip()
+    return str(content).strip()
+
+
+def _accepts_argument(params: dict[str, inspect.Parameter], name: str) -> bool:
+    if not params:
+        return True
+    if name in params:
+        return True
+    return any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
 
 
 async def _call_dedalus_runner(
@@ -166,109 +348,165 @@ async def _call_dedalus_runner(
     prompt: str,
     system: str,
     caller: str,
-) -> dict:
-    sys = system or DEFAULT_JSON_SYSTEM
+    response_model: Optional[type[BaseModel]] = None,
+) -> dict[str, Any]:
+    response_model = _require_response_model(response_model)
+    sys = _build_system_prompt(system)
     model = os.getenv("DEDALUS_MODEL", "anthropic/claude-sonnet-4-20250514")
-    debug = os.getenv("DEDALUS_RUNNER_DEBUG", "true").lower() in ("1", "true", "yes")
-    verbose = os.getenv("DEDALUS_RUNNER_VERBOSE", "true").lower() in ("1", "true", "yes")
+    debug = os.getenv("DEDALUS_RUNNER_DEBUG", "false").lower() in ("1", "true", "yes")
+    verbose = os.getenv("DEDALUS_RUNNER_VERBOSE", "false").lower() in ("1", "true", "yes")
     max_steps = int(os.getenv("DEDALUS_MAX_STEPS", "5"))
+    temperature = float(os.getenv("LLM_TEMPERATURE", "0"))
+    started_at = time.monotonic()
 
-    sig = inspect.signature(runner.run)
-    params = sig.parameters
-    run_method = runner.run
-    is_async = inspect.iscoroutinefunction(run_method)
+    try:
+        params = inspect.signature(runner.run).parameters
+    except (TypeError, ValueError):
+        params = {}
 
-    user_prompt = prompt
-    for attempt in range(2):
-        kw: dict = {}
-        if "model" in params:
-            kw["model"] = model
-        if "input" in params:
-            kw["input"] = user_prompt
-        if "messages" in params and "input" not in kw:
-            kw["messages"] = [{"role": "user", "content": user_prompt}]
-        if "instructions" in params:
-            kw["instructions"] = sys
-        elif "system" in params:
-            kw["system"] = sys
-        if "max_steps" in params:
-            kw["max_steps"] = max_steps
-        if "debug" in params:
-            kw["debug"] = debug
-        if "verbose" in params:
-            kw["verbose"] = verbose
-
-        print(
-            f"  [DedalusRunner] {caller} run attempt {attempt + 1}/2 ({len(user_prompt)} chars) "
-            f"model={model} max_steps={max_steps} debug={debug} verbose={verbose}"
+    if not _accepts_argument(params, "response_format"):
+        raise RuntimeError(
+            "DedalusRunner.run does not accept response_format. "
+            "Upgrade dedalus_labs to a version that supports structured outputs."
         )
-        t0 = time.monotonic()
 
-        if is_async:
-            result = await run_method(**kw)
-        else:
-            result = run_method(**kw)
-
-        elapsed = int((time.monotonic() - t0) * 1000)
-        final = getattr(result, "final_output", None)
-        if final is None:
-            final = getattr(result, "output", None)
-        if final is None:
-            final = str(result)
-
-        raw_str = str(final)
-        steps = getattr(result, "steps_used", None)
-        print(
-            f"  [DedalusRunner] {caller} done ({elapsed}ms) "
-            f"steps_used={steps!r} final_output_len={len(raw_str)}"
-        )
-        print(f"  [DedalusRunner] {caller} raw final_output (preview 600 chars):\n{raw_str[:600]}")
-
+    last_validation_error: Optional[Exception] = None
+    for attempt in range(MAX_VALIDATION_RETRIES + 1):
         try:
-            return _parse_json_with_recovery(raw_str, caller, "DedalusRunner")
-        except (json.JSONDecodeError, RuntimeError):
-            if attempt == 0:
-                user_prompt = (
-                    prompt
-                    + "\n\nIMPORTANT: Respond with a single compact valid JSON object only — "
-                    "max 6 items per list, max 80 chars per string value. Raw JSON only, no markdown."
+            kwargs: dict[str, Any] = {"response_format": response_model}
+            if _accepts_argument(params, "model"):
+                kwargs["model"] = model
+            if _accepts_argument(params, "input"):
+                kwargs["input"] = prompt
+            elif _accepts_argument(params, "messages"):
+                kwargs["messages"] = [{"role": "user", "content": prompt}]
+            if _accepts_argument(params, "instructions"):
+                kwargs["instructions"] = sys
+            elif _accepts_argument(params, "system"):
+                kwargs["system"] = sys
+            if _accepts_argument(params, "max_steps"):
+                kwargs["max_steps"] = max_steps
+            if _accepts_argument(params, "debug"):
+                kwargs["debug"] = debug
+            if _accepts_argument(params, "verbose"):
+                kwargs["verbose"] = verbose
+            if _accepts_argument(params, "temperature"):
+                kwargs["temperature"] = temperature
+
+            pending = runner.run(**kwargs)
+            if not inspect.isawaitable(pending):
+                raise DedalusOutputError(
+                    "DedalusRunner.run returned a non-awaitable result while using AsyncDedalus"
                 )
-                continue
-            print(f"  [DedalusRunner] {caller} FAILED invalid JSON after retry")
-            raise
 
-    raise RuntimeError("DedalusRunner returned invalid JSON")
-
-
-async def call_llm(prompt: str, system: str = "", caller: str = "llm") -> dict:
-    sys = system or DEFAULT_JSON_SYSTEM
-
-    runner = _get_runner_for_call()
-    if runner is not None:
-        return await _call_dedalus_runner(runner, prompt, sys, caller)
-
-    print(f"  [LLM/K2] {caller} call start ({len(prompt)} chars)")
-    t0 = time.monotonic()
-
-    for attempt in range(2):
-        user_content = prompt
-        if attempt == 1:
-            user_content = (
-                prompt
-                + "\n\nIMPORTANT: Your entire reply must be one JSON object only. "
-                "No prose. If you used markdown before, output raw JSON only now. "
-                "Max 6 items per list, max 80 chars per string value."
+            result = await pending
+            final_output = extract_final_output(result, caller)
+            payload = _coerce_response_payload(final_output, response_model, caller, "DedalusRunner")
+            _finalize_success("DedalusRunner", caller, started_at, attempt)
+            return payload
+        except LLMResponseValidationError as exc:
+            last_validation_error = exc
+            if attempt == MAX_VALIDATION_RETRIES:
+                break
+            continue
+        except Exception as exc:
+            _raise_terminal_error(
+                "DedalusRunner",
+                caller,
+                started_at=started_at,
+                retry_count=attempt,
+                kind="runtime_error",
+                exc=exc,
             )
 
-        payload = {
-            "model": K2_MODEL,
-            "messages": [
-                {"role": "system", "content": sys},
-                {"role": "user", "content": user_content},
-            ],
-            "stream": False,
-        }
+    assert last_validation_error is not None
+    _raise_terminal_error(
+        "DedalusRunner",
+        caller,
+        started_at=started_at,
+        retry_count=MAX_VALIDATION_RETRIES,
+        kind="validation_failed",
+        exc=last_validation_error,
+    )
+    raise AssertionError("unreachable")
 
+
+async def _call_dedalus_machine(
+    executor: object,
+    machine_id: str,
+    prompt: str,
+    system: str,
+    caller: str,
+    response_model: Optional[type[BaseModel]] = None,
+) -> dict[str, Any]:
+    response_model = _require_response_model(response_model)
+    sys = _build_system_prompt(system)
+    started_at = time.monotonic()
+
+    last_validation_error: Optional[Exception] = None
+    for attempt in range(MAX_VALIDATION_RETRIES + 1):
+        try:
+            raw_stdout = await executor.run_prompt_on_machine(
+                machine_id=machine_id,
+                prompt=prompt,
+                system=sys,
+                caller=caller,
+                response_model=response_model,
+            )
+            payload = _coerce_response_payload(raw_stdout, response_model, caller, "DedalusMachine")
+            _finalize_success("DedalusMachine", caller, started_at, attempt)
+            return payload
+        except LLMResponseValidationError as exc:
+            last_validation_error = exc
+            if attempt == MAX_VALIDATION_RETRIES:
+                break
+            continue
+        except Exception as exc:
+            _raise_terminal_error(
+                "DedalusMachine",
+                caller,
+                started_at=started_at,
+                retry_count=attempt,
+                kind="runtime_error",
+                exc=exc,
+            )
+
+    assert last_validation_error is not None
+    _raise_terminal_error(
+        "DedalusMachine",
+        caller,
+        started_at=started_at,
+        retry_count=MAX_VALIDATION_RETRIES,
+        kind="validation_failed",
+        exc=last_validation_error,
+    )
+    raise AssertionError("unreachable")
+
+
+async def _call_k2_local(
+    prompt: str,
+    system: str,
+    caller: str,
+    response_model: Optional[type[BaseModel]] = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    response_model = _require_response_model(response_model)
+    sys = _build_system_prompt(system)
+    started_at = time.monotonic()
+    timeout_seconds = timeout_seconds or float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+    payload = {
+        "model": K2_MODEL,
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": _build_json_schema_response_format(response_model),
+        "temperature": float(os.getenv("LLM_TEMPERATURE", "0")),
+        "stream": False,
+    }
+
+    last_validation_error: Optional[Exception] = None
+    for attempt in range(MAX_VALIDATION_RETRIES + 1):
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -278,29 +516,91 @@ async def call_llm(prompt: str, system: str = "", caller: str = "llm") -> dict:
                         "Content-Type": "application/json",
                     },
                     json=payload,
-                    timeout=60.0,
+                    timeout=timeout_seconds,
                 )
                 response.raise_for_status()
                 data = response.json()
-        except httpx.TimeoutException:
-            elapsed = int((time.monotonic() - t0) * 1000)
-            print(f"  [LLM/K2] {caller} TIMEOUT after {elapsed}ms")
-            raise
 
-        raw_content = _k2_extract_message_content(data, caller)
-        print(f"  [LLM/K2] {caller} raw message.content length={len(raw_content)}")
-        preview = raw_content if len(raw_content) <= 1200 else raw_content[:1200] + "..."
-        print(f"  [LLM/K2] {caller} raw (preview):\n{preview}")
-
-        try:
-            result = _parse_json_with_recovery(raw_content, caller, "LLM/K2")
-            elapsed = int((time.monotonic() - t0) * 1000)
-            print(f"  [LLM/K2] {caller} call success ({elapsed}ms)")
+            raw_content = _extract_k2_message_content(data, caller)
+            parsed = _strict_json_object(raw_content, caller, "LLM/K2")
+            result = _validate_payload(parsed, response_model, caller, "LLM/K2")
+            _finalize_success("LLM/K2", caller, started_at, attempt)
             return result
-        except (json.JSONDecodeError, RuntimeError):
-            if attempt == 1:
-                elapsed = int((time.monotonic() - t0) * 1000)
-                print(f"  [LLM/K2] {caller} FAILED invalid JSON after retry ({elapsed}ms)")
-                raise
+        except LLMResponseValidationError as exc:
+            last_validation_error = exc
+            if attempt == MAX_VALIDATION_RETRIES:
+                break
+            continue
+        except httpx.TimeoutException as exc:
+            timeout_error = RuntimeError(f"{caller}: LLM/K2 timed out after {int(timeout_seconds)}s")
+            _raise_terminal_error(
+                "LLM/K2",
+                caller,
+                started_at=started_at,
+                retry_count=attempt,
+                kind="timeout",
+                exc=timeout_error,
+            )
+        except Exception as exc:
+            _raise_terminal_error(
+                "LLM/K2",
+                caller,
+                started_at=started_at,
+                retry_count=attempt,
+                kind="runtime_error",
+                exc=exc,
+            )
 
-    raise RuntimeError("LLM returned invalid JSON after retry")
+    assert last_validation_error is not None
+    _raise_terminal_error(
+        "LLM/K2",
+        caller,
+        started_at=started_at,
+        retry_count=MAX_VALIDATION_RETRIES,
+        kind="validation_failed",
+        exc=last_validation_error,
+    )
+    raise AssertionError("unreachable")
+
+
+async def call_llm(
+    prompt: str,
+    system: str = "",
+    caller: str = "llm",
+    response_model: Optional[type[BaseModel]] = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    machine_executor, machine_id = _get_machine_executor_for_call()
+    if machine_executor is not None and machine_id is not None:
+        return await _call_dedalus_machine(
+            machine_executor,
+            machine_id,
+            prompt,
+            system,
+            caller,
+            response_model=response_model,
+        )
+
+    dedalus_requested = _use_dedalus_runner_for_llm()
+    runner = _get_runner_for_call()
+    if dedalus_requested:
+        if runner is None:
+            raise RuntimeError(
+                "Dedalus runtime requested but no DedalusRunner is available. "
+                "Set DEDALUS_API_KEY or use RUNTIME_MODE=local explicitly."
+            )
+        return await _call_dedalus_runner(
+            runner,
+            prompt,
+            system,
+            caller,
+            response_model=response_model,
+        )
+
+    return await _call_k2_local(
+        prompt,
+        system,
+        caller,
+        response_model=response_model,
+        timeout_seconds=timeout_seconds,
+    )

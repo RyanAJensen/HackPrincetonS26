@@ -10,17 +10,19 @@ Replan / ad-hoc `call_llm` uses a process-wide shared runner when RUNTIME_MODE !
 
 Runtime label:
   "dedalus" — DedalusRunner completed the agent step
-  "local"   — DEDALUS_API_KEY missing, dedalus_labs not installed, or RUNTIME_MODE=local
+  "local"   — explicit RUNTIME_MODE=local only
 """
 from __future__ import annotations
 import os
 import traceback
 from datetime import datetime
-from typing import Callable, Awaitable, Any, Optional
+from typing import Callable, Awaitable, Any
 
 from models.agent import AgentRun, AgentStatus
 from db import save_agent_run
 from runtime.base import AgentRuntime
+from runtime.dedalus_client_config import build_dedalus_client_kwargs, describe_dedalus_billing_mode
+from runtime.run_state import finalize_run_failure, finalize_run_success
 
 DEDALUS_IMPORT_ERROR: str | None = None
 try:
@@ -37,13 +39,14 @@ except ImportError as _e:
 AGENT_ROLE_MAP: dict[str, str] = {
     "incident_parser": "situation",
     "risk_assessor": "intelligence",
-    "action_planner": "intelligence",
+    "action_planner": "operations",
     "communications": "communications",
 }
 
 ROLE_LABELS: dict[str, str] = {
     "situation": "Situation Unit",
     "intelligence": "Intelligence",
+    "operations": "Operations Planner",
     "communications": "Communications Officer",
 }
 
@@ -63,9 +66,12 @@ def get_shared_dedalus_runner() -> Any | None:
     if not api_key:
         return None
     if _shared_runner is None:
-        _shared_client = AsyncDedalus(api_key=api_key)
+        _shared_client = AsyncDedalus(**build_dedalus_client_kwargs(api_key))
         _shared_runner = DedalusRunner(_shared_client)
-        print("[Dedalus] DedalusRunner singleton initialized (shared for replan + agents)")
+        print(
+            "[Dedalus] DedalusRunner singleton initialized "
+            f"(shared for replan + agents, billing={describe_dedalus_billing_mode()})"
+        )
     return _shared_runner
 
 
@@ -77,53 +83,41 @@ class DedalusAgentRuntime(AgentRuntime):
         self._client: Any = None
         self._runner: Any = None
 
-        require = os.getenv("REQUIRE_DEDALUS", "").lower() == "true"
-        if require:
-            if not DEDALUS_LABS_AVAILABLE:
-                raise RuntimeError("REQUIRE_DEDALUS=true but dedalus_labs is not installed")
-            if not self.api_key:
-                raise RuntimeError("REQUIRE_DEDALUS=true but DEDALUS_API_KEY is not set")
-
-        if DEDALUS_LABS_AVAILABLE and self.api_key:
-            print(
-                "[Dedalus] Mode: DedalusRunner (AsyncDedalus) — no machine lifecycle, "
-                "outputs from result.final_output only"
-            )
-        elif not self.api_key:
-            print("[Dedalus] DEDALUS_API_KEY not set — agent execution uses local runtime (K2)")
-        else:
+        if not DEDALUS_LABS_AVAILABLE:
             detail = DEDALUS_IMPORT_ERROR or "unknown ImportError"
-            print(
-                "[Dedalus] dedalus_labs SDK unavailable — agent execution uses local runtime (K2). "
-                f"Import error: {detail}"
+            raise RuntimeError(
+                "Dedalus runtime requested but dedalus_labs is unavailable. "
+                f"Import error: {detail}. Install dedalus_labs or set RUNTIME_MODE=local explicitly."
             )
+        if not self.api_key:
+            raise RuntimeError(
+                "Dedalus runtime requested but DEDALUS_API_KEY is not set. "
+                "Set DEDALUS_API_KEY or use RUNTIME_MODE=local explicitly."
+            )
+
+        print(
+            "[Dedalus] Mode: DedalusRunner (AsyncDedalus) — no machine lifecycle, "
+            "outputs from awaited result.final_output only; "
+            f"billing={describe_dedalus_billing_mode()}"
+        )
 
     def _ensure_runner(self) -> Any:
         if not DEDALUS_LABS_AVAILABLE or not self.api_key:
             raise RuntimeError("DedalusRunner requested but SDK or API key unavailable")
         if self._runner is None:
-            self._client = AsyncDedalus(api_key=self.api_key)
+            self._client = AsyncDedalus(**build_dedalus_client_kwargs(self.api_key))
             self._runner = DedalusRunner(self._client)
             print("[Dedalus] DedalusRunner bound to DedalusAgentRuntime")
         return self._runner
 
     def runtime_name(self) -> str:
-        return "dedalus" if DEDALUS_LABS_AVAILABLE and self.api_key else "local"
+        return "dedalus"
 
     async def execute(
         self,
         run: AgentRun,
         fn: Callable[[AgentRun], Awaitable[dict]],
     ) -> AgentRun:
-        if not DEDALUS_LABS_AVAILABLE or not self.api_key:
-            strict = os.getenv("DEDALUS_STRICT", "").lower() in ("1", "true", "yes")
-            if strict:
-                raise RuntimeError(
-                    "DEDALUS_STRICT: DedalusAgentRuntime cannot fall back to K2 — "
-                    "install dedalus_labs, set DEDALUS_API_KEY, and ensure startup checks passed"
-                )
-            return await self._local_fallback(run, fn)
-
         from agents.dedalus_context import dedalus_runner_ctx
 
         runner = self._ensure_runner()
@@ -141,44 +135,13 @@ class DedalusAgentRuntime(AgentRuntime):
 
         try:
             result = await fn(run)
-            run.output_artifact = result
-            run.status = AgentStatus.COMPLETED
-            run.completed_at = datetime.utcnow()
-            run.log_entries.append("DedalusRunner — agent completed; output from result.final_output → parsed JSON")
+            finalize_run_success(
+                run,
+                result,
+                "DedalusRunner — agent completed; awaited result.final_output validated via structured output schema",
+            )
         except Exception as e:
-            run.status = AgentStatus.FAILED
-            run.completed_at = datetime.utcnow()
-            run.error_message = str(e)
-            run.log_entries.append(f"DedalusRunner FAILED: {e}")
-            run.log_entries.append(traceback.format_exc())
-        finally:
-            dedalus_runner_ctx.reset(token)
-
-        save_agent_run(run)
-        return run
-
-    async def _local_fallback(self, run: AgentRun, fn: Callable) -> AgentRun:
-        from agents.dedalus_context import dedalus_runner_ctx
-
-        run.runtime = "local"
-        run.status = AgentStatus.RUNNING
-        run.started_at = datetime.utcnow()
-        run.machine_id = None
-        run.log_entries.append("Local runtime — K2 Think (no DedalusRunner context)")
-        save_agent_run(run)
-        token = dedalus_runner_ctx.set(None)
-        try:
-            result = await fn(run)
-            run.output_artifact = result
-            run.status = AgentStatus.COMPLETED
-            run.completed_at = datetime.utcnow()
-            run.log_entries.append("Completed (local runtime)")
-        except Exception as e:
-            run.status = AgentStatus.FAILED
-            run.completed_at = datetime.utcnow()
-            run.error_message = str(e)
-            run.log_entries.append(f"FAILED: {e}")
-            run.log_entries.append(traceback.format_exc())
+            finalize_run_failure(run, e, "DedalusRunner FAILED", traceback.format_exc())
         finally:
             dedalus_runner_ctx.reset(token)
 

@@ -49,13 +49,8 @@ export default function LandingPage() {
   const startAnalysis = async (incidentId: string) => {
     setStep("loading");
     setLoadingMsg("Analyzing incident and generating medical response IAP…");
-    try {
-      await api.incidents.analyze(incidentId);
-      router.push(`/incidents/${incidentId}`);
-    } catch {
-      // Still navigate — incident page will handle the error state
-      router.push(`/incidents/${incidentId}`);
-    }
+    await api.incidents.analyze(incidentId);
+    router.push(`/incidents/${incidentId}`);
   };
 
   const handleFormSubmit = async (e: React.FormEvent) => {
@@ -87,6 +82,7 @@ export default function LandingPage() {
       await startAnalysis(incident.id);
     } catch (err) {
       setError(String(err));
+      setStep("home");
       setLoadingDemo("");
     }
   };

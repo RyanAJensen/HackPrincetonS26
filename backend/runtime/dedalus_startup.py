@@ -11,6 +11,7 @@ import traceback
 from typing import Any
 
 import runtime.dedalus_runtime as dedalus_runtime
+from runtime.dedalus_client_config import build_dedalus_client_kwargs, describe_dedalus_billing_mode
 
 
 def print_dedalus_runtime_diagnostics() -> None:
@@ -62,7 +63,7 @@ def verify_dedalus_runner_constructible() -> tuple[bool, str]:
     try:
         from dedalus_labs import AsyncDedalus, DedalusRunner
 
-        client = AsyncDedalus(api_key=key)
+        client = AsyncDedalus(**build_dedalus_client_kwargs(key))
         runner = DedalusRunner(client)
         _ = runner
         return True, "DedalusRunner(client) OK"
@@ -84,6 +85,7 @@ def run_startup_dedalus_checks() -> dict[str, Any]:
     print_dedalus_runtime_diagnostics()
 
     ok, path_or_err, extra_detail = _verify_dedalus_sdk_import()
+    print("  [Dedalus verify] billing mode:", describe_dedalus_billing_mode())
     print(
         "  [Dedalus verify] import dedalus_labs -> AsyncDedalus, DedalusRunner:",
         "OK" if ok else "FAILED",

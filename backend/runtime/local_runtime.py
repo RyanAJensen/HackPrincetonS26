@@ -9,6 +9,7 @@ from typing import Callable, Awaitable
 from models.agent import AgentRun, AgentStatus
 from db import save_agent_run
 from runtime.base import AgentRuntime
+from runtime.run_state import finalize_run_failure, finalize_run_success
 
 
 class LocalAgentRuntime(AgentRuntime):
@@ -28,16 +29,9 @@ class LocalAgentRuntime(AgentRuntime):
 
         try:
             result = await fn(run)
-            run.output_artifact = result
-            run.status = AgentStatus.COMPLETED
-            run.completed_at = datetime.utcnow()
-            run.log_entries.append(f"[{run.completed_at.isoformat()}] Completed successfully")
+            finalize_run_success(run, result, "Completed successfully")
         except Exception as e:
-            run.status = AgentStatus.FAILED
-            run.completed_at = datetime.utcnow()
-            run.error_message = str(e)
-            run.log_entries.append(f"[{run.completed_at.isoformat()}] FAILED: {e}")
-            run.log_entries.append(traceback.format_exc())
+            finalize_run_failure(run, e, "FAILED", traceback.format_exc())
 
         save_agent_run(run)
         return run
