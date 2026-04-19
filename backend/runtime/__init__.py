@@ -11,5 +11,13 @@ def get_runtime() -> AgentRuntime:
     if runtime_mode == "local":
         return LocalAgentRuntime()
     if runtime_mode == "swarm":
-        return DedalusMachineSwarmRuntime()
-    return DedalusAgentRuntime()
+        try:
+            return DedalusMachineSwarmRuntime()
+        except Exception as e:
+            print(f"[Runtime] Swarm init failed ({e}); falling back to local K2")
+            return LocalAgentRuntime()
+    try:
+        return DedalusAgentRuntime()
+    except Exception as e:
+        print(f"[Runtime] Dedalus init failed ({e}); falling back to local K2")
+        return LocalAgentRuntime()

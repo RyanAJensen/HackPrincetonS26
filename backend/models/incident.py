@@ -30,6 +30,19 @@ class Resource(BaseModel):
     contact: Optional[str] = None
 
 
+class HospitalCapacity(BaseModel):
+    """Current capacity status of a receiving facility."""
+    name: str
+    available_beds: Optional[int] = None
+    total_beds: Optional[int] = None
+    # normal | elevated | critical | diversion
+    status: str = "normal"
+    # trauma | burn | pediatric | decon | general
+    specialty: Optional[str] = None
+    distance_mi: Optional[float] = None
+    eta_min: Optional[int] = None
+
+
 class Incident(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -39,6 +52,7 @@ class Incident(BaseModel):
     location: str
     severity_hint: Optional[SeverityLevel] = None
     resources: list[Resource] = Field(default_factory=list)
+    hospital_capacities: list[HospitalCapacity] = Field(default_factory=list)
     status: IncidentStatus = IncidentStatus.PENDING
     current_plan_version: int = 0
 
@@ -49,8 +63,10 @@ class IncidentCreate(BaseModel):
     location: str
     severity_hint: Optional[SeverityLevel] = None
     resources: list[Resource] = Field(default_factory=list)
+    hospital_capacities: list[HospitalCapacity] = Field(default_factory=list)
 
 
 class IncidentUpdate(BaseModel):
     update_text: str
     updated_resources: Optional[list[Resource]] = None
+    updated_hospital_capacities: Optional[list[HospitalCapacity]] = None

@@ -9,13 +9,15 @@ import { Accordion } from "@/components/sentinel/Accordion";
 import { CommunicationsPanel } from "@/components/sentinel/CommunicationsPanel";
 import { PlanVersionHistory } from "@/components/sentinel/PlanVersionHistory";
 import { ExternalContextPanel } from "@/components/sentinel/ExternalContextPanel";
-import { api, type Incident, type PlanVersion, type AgentRun, type PlanDiff, type ActionItem, type MedicalImpact, type TriagePriority, type PatientTransport } from "@/lib/api";
+import { api, type Incident, type PlanVersion, type AgentRun, type PlanDiff, type ActionItem, type MedicalImpact, type TriagePriority, type PatientTransport, type PatientFlowSummary, type FacilityAssignment, type DecisionPoint, type Tradeoff } from "@/lib/api";
 
 const QUICK_UPDATES = [
-  "Additional patients found — revise injury count upward",
-  "Primary EMS route blocked — need alternate transport path",
-  "Receiving hospital at capacity — identify alternate facility",
-  "Critical patient deteriorating — immediate transport required",
+  "Additional patients found — revise counts",
+  "Primary route blocked — need alternate",
+  "Receiving hospital at capacity — reroute",
+  "Critical patient deteriorating — transport now",
+  "Decon corridor established — update routing",
+  "Hospital confirmed ready — update ETA",
 ];
 
 // ---- IAP sub-components ----
@@ -45,7 +47,7 @@ function IncidentOverview({ incident, plan, alertCount }: {
           <p className="text-[10px] text-muted-foreground uppercase tracking-widest">Initiated</p>
           <p className="text-xs text-foreground/70">{new Date(incident.created_at).toLocaleTimeString()}</p>
           {plan && (
-            <p className="text-[10px] text-muted-foreground/50 mt-0.5">IAP v{plan.version}</p>
+            <p className="text-[10px] text-muted-foreground/50 mt-0.5">Plan v{plan.version}</p>
           )}
         </div>
       </div>
@@ -398,6 +400,144 @@ function DiffSummary({ diff }: { diff: PlanDiff }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+const STRAIN_STYLES = {
+  normal: { border: "border-green-500/30", bg: "bg-green-500/5", dot: "bg-green-500", text: "text-green-400" },
+  elevated: { border: "border-orange-500/30", bg: "bg-orange-500/5", dot: "bg-orange-500", text: "text-orange-400" },
+  critical: { border: "border-red-500/30", bg: "bg-red-500/8", dot: "bg-red-500", text: "text-red-400" },
+};
+
+function PatientFlowPanel({ flow }: { flow: PatientFlowSummary }) {
+  const total = flow.total_incoming;
+  return (
+    <div className="p-4 rounded-lg border border-border bg-card space-y-4">
+      <div className="flex items-baseline gap-2">
+        <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Patient Flow Overview</p>
+        {total > 0 && <span className="text-xs text-muted-foreground">— {total} incoming</span>}
+      </div>
+
+      {total > 0 && (
+        <div className="grid grid-cols-4 gap-2">
+          <div className="p-2 rounded border border-border bg-card/60 text-center">
+            <p className="text-xl font-bold text-foreground">{total}</p>
+            <p className="text-[9px] text-muted-foreground uppercase tracking-widest">Total</p>
+          </div>
+          <div className="p-2 rounded border border-red-500/30 bg-red-500/8 text-center">
+            <p className="text-xl font-bold text-red-400">{flow.critical}</p>
+            <p className="text-[9px] text-red-400/70 uppercase tracking-widest">Critical</p>
+          </div>
+          <div className="p-2 rounded border border-orange-500/30 bg-orange-500/8 text-center">
+            <p className="text-xl font-bold text-orange-400">{flow.moderate}</p>
+            <p className="text-[9px] text-orange-400/70 uppercase tracking-widest">Moderate</p>
+          </div>
+          <div className="p-2 rounded border border-yellow-500/25 bg-yellow-500/5 text-center">
+            <p className="text-xl font-bold text-yellow-400">{flow.minor}</p>
+            <p className="text-[9px] text-yellow-400/70 uppercase tracking-widest">Minor</p>
+          </div>
+        </div>
+      )}
+
+      {flow.facility_assignments.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Facility Assignments</p>
+          {flow.facility_assignments.map((fa, i) => {
+            const s = STRAIN_STYLES[fa.capacity_strain] ?? STRAIN_STYLES.normal;
+            return (
+              <div key={i} className={`p-3 rounded border ${s.border} ${s.bg}`}>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${s.dot}`} />
+                    <span className="text-xs font-semibold text-foreground truncate">{fa.hospital}</span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className={`text-[10px] font-bold ${s.text}`}>{fa.capacity_strain.toUpperCase()}</span>
+                    <span className="text-sm font-bold text-foreground">{fa.patients_assigned} pts</span>
+                  </div>
+                </div>
+                {fa.patient_types.length > 0 && (
+                  <div className="flex gap-1 flex-wrap ml-3.5 mb-1">
+                    {fa.patient_types.map((pt, j) => (
+                      <span key={j} className="text-[9px] px-1.5 py-0.5 rounded border border-border text-muted-foreground/80">{pt}</span>
+                    ))}
+                  </div>
+                )}
+                {fa.routing_reason && <p className="text-[11px] text-foreground/60 ml-3.5">{fa.routing_reason}</p>}
+                {fa.reroute_trigger && (
+                  <p className="text-[10px] text-orange-400/70 ml-3.5 mt-0.5">Reroute if: {fa.reroute_trigger}</p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {flow.bottlenecks.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Active Bottlenecks</p>
+          {flow.bottlenecks.map((b, i) => (
+            <div key={i} className="flex gap-2 text-xs items-start">
+              <span className="text-orange-400/70 shrink-0">⚠</span>
+              <span className="text-foreground/80">{b}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {flow.distribution_rationale && (
+        <p className="text-[11px] text-muted-foreground/70 border-t border-border/50 pt-2">
+          {flow.distribution_rationale}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function DecisionPointsPanel({ points }: { points: DecisionPoint[] }) {
+  if (!points.length) return null;
+  return (
+    <div className="space-y-2">
+      {points.map((dp, i) => (
+        <div key={i} className="p-3 rounded border border-border bg-card/40 text-xs space-y-1.5">
+          <p className="font-semibold text-foreground">{dp.decision}</p>
+          <p className="text-foreground/65">{dp.reason}</p>
+          {dp.assumption && (
+            <p className="text-muted-foreground/60"><span className="font-medium text-muted-foreground">Assumes:</span> {dp.assumption}</p>
+          )}
+          {dp.replan_trigger && (
+            <p className="text-amber-400/80"><span className="font-medium">Replan if:</span> {dp.replan_trigger}</p>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TradeoffsPanel({ tradeoffs }: { tradeoffs: Tradeoff[] }) {
+  if (!tradeoffs.length) return null;
+  return (
+    <div className="space-y-3">
+      {tradeoffs.map((t, i) => (
+        <div key={i} className="p-3 rounded border border-border bg-card/40 text-xs space-y-2">
+          <p className="font-semibold text-foreground text-[11px] uppercase tracking-wide text-muted-foreground">{t.description}</p>
+          <div className="grid grid-cols-2 gap-2">
+            <div className="p-2 rounded border border-border/50">
+              <p className="text-[9px] text-muted-foreground uppercase tracking-widest mb-0.5">Option A</p>
+              <p className="text-foreground/80">{t.option_a}</p>
+            </div>
+            <div className="p-2 rounded border border-border/50">
+              <p className="text-[9px] text-muted-foreground uppercase tracking-widest mb-0.5">Option B</p>
+              <p className="text-foreground/80">{t.option_b}</p>
+            </div>
+          </div>
+          <div className="flex gap-2 items-start">
+            <span className="text-green-400/80 shrink-0 text-[10px] font-bold uppercase mt-0.5">→</span>
+            <p className="text-foreground/85">{t.recommendation}</p>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -805,22 +945,43 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
           <div className="p-3 rounded border border-red-500/30 bg-red-500/8 text-red-400 text-xs">{error}</div>
         )}
 
-        {/* IAP Section 1 — Incident Overview */}
+        {/* Incident Overview */}
         <IncidentOverview incident={incident} plan={displayPlan ?? null} alertCount={alertCount} />
 
-        {/* Medical Impact */}
-        {displayPlan?.medical_impact && (
-          <div className="space-y-2">
-            <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
-              Medical Impact
+        {/* Generating state */}
+        {isProcessing && !plan && (
+          <div className="p-8 rounded-lg border border-border bg-card text-center space-y-3">
+            <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin mx-auto" />
+            <p className="text-sm text-foreground font-medium">
+              {replanning ? "Revising coordination plan…" : "Generating coordination plan…"}
             </p>
-            <div className="p-4 rounded-lg border border-red-500/20 bg-red-500/5">
-              <MedicalImpactPanel impact={displayPlan.medical_impact} />
-            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Situation → Intelligence → Patient Flow → Communications
+            </p>
           </div>
         )}
 
-        {/* Triage Priorities */}
+        {/* Replanning notice */}
+        {isProcessing && plan && (
+          <div className="flex items-center gap-2 px-4 py-2.5 rounded border border-primary/20 bg-primary/5 text-xs text-primary">
+            <div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin shrink-0" />
+            Revising coordination plan based on field update…
+          </div>
+        )}
+
+        {/* What Changed (replan diff — most prominent) */}
+        {activeDiff && (
+          <div className="px-4 py-3 rounded border border-cyan-500/20 bg-cyan-500/5">
+            <DiffSummary diff={activeDiff} />
+          </div>
+        )}
+
+        {/* 1. PATIENT FLOW OVERVIEW — hero section */}
+        {displayPlan?.patient_flow && (
+          <PatientFlowPanel flow={displayPlan.patient_flow} />
+        )}
+
+        {/* 2. TRIAGE PRIORITIES */}
         {displayPlan?.triage_priorities && displayPlan.triage_priorities.length > 0 && (
           <div className="space-y-2">
             <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
@@ -830,86 +991,7 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
           </div>
         )}
 
-        {/* Patient Transport Plan — ArcGIS + planner (updates on replan) */}
-        {displayPlan &&
-          (displayPlan.patient_transport != null || (ext?.hospitals && ext.hospitals.length > 0)) && (
-          <div className="space-y-2">
-            <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
-              Patient Transport Plan
-            </p>
-            <div className="p-4 rounded-lg border border-blue-500/20 bg-blue-500/5">
-              <PatientTransportPanel
-                transport={displayPlan.patient_transport ?? null}
-                hospitals={ext?.hospitals}
-                primaryRoute={ext?.primary_access_route ?? undefined}
-                alternateRoute={ext?.alternate_access_route ?? undefined}
-              />
-            </div>
-          </div>
-        )}
-
-        {/* Threat Analysis (healthcare-aware) */}
-        {displayPlan &&
-          (displayPlan.risk_notes.length > 0 ||
-            (ext?.healthcare_risks && ext.healthcare_risks.length > 0) ||
-            (ext?.replan_triggers && ext.replan_triggers.length > 0) ||
-            (ext?.weather_driven_threats && ext.weather_driven_threats.length > 0)) && (
-          <div className="space-y-2">
-            <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
-              Threat Analysis
-            </p>
-            <div className="p-4 rounded-lg border border-orange-500/20 bg-orange-500/5">
-              <ThreatAnalysisPanel
-                primaryRisks={displayPlan.risk_notes}
-                healthcareRisks={ext?.healthcare_risks ?? []}
-                replanTriggers={ext?.replan_triggers ?? []}
-                weatherThreats={ext?.weather_driven_threats ?? []}
-              />
-            </div>
-          </div>
-        )}
-
-        {/* Generating state */}
-        {isProcessing && !plan && (
-          <div className="p-8 rounded-lg border border-border bg-card text-center space-y-3">
-            <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin mx-auto" />
-            <p className="text-sm text-foreground font-medium">
-              {replanning ? "Revising IAP…" : "Generating Incident Action Plan…"}
-            </p>
-            <p className="text-[11px] text-muted-foreground">
-              Situation → Risk → Triage → Transport → Communications
-            </p>
-          </div>
-        )}
-
-        {/* Replanning notice */}
-        {isProcessing && plan && (
-          <div className="flex items-center gap-2 px-4 py-2.5 rounded border border-primary/20 bg-primary/5 text-xs text-primary">
-            <div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin shrink-0" />
-            Revising IAP based on field update…
-          </div>
-        )}
-
-        {/* IAP diff */}
-        {activeDiff && (
-          <div className="px-4 py-3 rounded border border-cyan-500/20 bg-cyan-500/5">
-            <DiffSummary diff={activeDiff} />
-          </div>
-        )}
-
-        {/* IAP Section 2 — Incident Objectives */}
-        {displayPlan?.incident_objectives && displayPlan.incident_objectives.length > 0 && (
-          <div className="space-y-2">
-            <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
-              Incident Objectives
-            </p>
-            <div className="p-4 rounded-lg border border-border bg-card/40">
-              <IncidentObjectives objectives={displayPlan.incident_objectives} />
-            </div>
-          </div>
-        )}
-
-        {/* IAP Section 4 Immediate — Priority Actions focal point */}
+        {/* 3. IMMEDIATE ACTIONS */}
         {displayPlan && displayPlan.immediate_actions.length > 0 && (
           <div className="space-y-2">
             <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest px-0.5">
@@ -922,10 +1004,31 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
         {/* Agent status */}
         <SystemActivity runs={agentRuns} isLoading={isProcessing} />
 
-        {/* Collapsible IAP sections */}
+        {/* Collapsible sections */}
         {displayPlan && (
           <>
-            {/* Section 3 — Operational Priorities */}
+            {/* Decision Points */}
+            {displayPlan.decision_points?.length > 0 && (
+              <Accordion title="Coordination Decisions" defaultOpen>
+                <DecisionPointsPanel points={displayPlan.decision_points} />
+              </Accordion>
+            )}
+
+            {/* Tradeoffs */}
+            {displayPlan.tradeoffs?.length > 0 && (
+              <Accordion title="Decision Tradeoffs">
+                <TradeoffsPanel tradeoffs={displayPlan.tradeoffs} />
+              </Accordion>
+            )}
+
+            {/* Incident Objectives */}
+            {displayPlan.incident_objectives?.length > 0 && (
+              <Accordion title="Incident Objectives">
+                <IncidentObjectives objectives={displayPlan.incident_objectives} />
+              </Accordion>
+            )}
+
+            {/* Operational Priorities */}
             <Accordion
               title="Operational Priorities"
               defaultOpen={["high", "critical"].includes(displayPlan.assessed_severity)}
@@ -938,12 +1041,48 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
               <OperationalPriorities priorities={displayPlan.operational_priorities} />
             </Accordion>
 
-            {/* Section 4 — Full Execution Plan */}
+            {/* Full Execution Plan */}
             <Accordion title="Execution Plan">
               <ExecutionPlan plan={displayPlan} diff={activeDiff} />
             </Accordion>
 
-            {/* Section 5 — Resource Assignments */}
+            {/* Threat Analysis */}
+            {(displayPlan.risk_notes.length > 0 ||
+              (ext?.healthcare_risks && ext.healthcare_risks.length > 0) ||
+              (ext?.replan_triggers && ext.replan_triggers.length > 0)) && (
+              <Accordion title="Threat Analysis">
+                <ThreatAnalysisPanel
+                  primaryRisks={displayPlan.risk_notes}
+                  healthcareRisks={ext?.healthcare_risks ?? []}
+                  replanTriggers={ext?.replan_triggers ?? []}
+                  weatherThreats={ext?.weather_driven_threats ?? []}
+                />
+              </Accordion>
+            )}
+
+            {/* Patient Transport */}
+            {(displayPlan.patient_transport != null || (ext?.hospitals && ext.hospitals.length > 0)) && (
+              <Accordion title="Transport & Routing">
+                <PatientTransportPanel
+                  transport={displayPlan.patient_transport ?? null}
+                  hospitals={ext?.hospitals}
+                  primaryRoute={ext?.primary_access_route ?? undefined}
+                  alternateRoute={ext?.alternate_access_route ?? undefined}
+                />
+              </Accordion>
+            )}
+
+            {/* Communications Plan */}
+            <Accordion title="Communications Plan">
+              <CommsSummary plan={displayPlan} />
+            </Accordion>
+
+            {/* Situation Status */}
+            <Accordion title="Situation Status">
+              <SituationStatus plan={displayPlan} />
+            </Accordion>
+
+            {/* Resource Assignments */}
             <Accordion title="Resource Assignments">
               <ResourceAssignments
                 assignments={displayPlan.resource_assignments}
@@ -951,22 +1090,12 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
               />
             </Accordion>
 
-            {/* Section 6 — Safety */}
+            {/* Safety */}
             {displayPlan.safety_considerations.length > 0 && (
               <Accordion title="Safety Considerations">
                 <SafetyConsiderations items={displayPlan.safety_considerations} />
               </Accordion>
             )}
-
-            {/* Section 7 — Communications Plan */}
-            <Accordion title="Communications Plan">
-              <CommsSummary plan={displayPlan} />
-            </Accordion>
-
-            {/* Section 8 — Situation Status */}
-            <Accordion title="Situation Status">
-              <SituationStatus plan={displayPlan} />
-            </Accordion>
 
             {/* Live data */}
             {ext && (
@@ -977,7 +1106,7 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
 
             {/* Plan history */}
             {planVersions.length > 1 && (
-              <Accordion title={`IAP History (${planVersions.length} versions)`}>
+              <Accordion title={`Plan History (${planVersions.length} versions)`}>
                 <PlanVersionHistory
                   versions={planVersions}
                   currentVersion={viewVersion ?? plan?.version ?? 1}
@@ -1024,7 +1153,7 @@ export default function IncidentPage({ params }: { params: Promise<{ id: string 
               >
                 {replanning
                   ? <span className="flex items-center gap-1.5"><div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />Revising…</span>
-                  : <span>Update &<br />Revise IAP</span>
+                  : <span>Update &<br />Revise Plan</span>
                 }
               </Button>
             </div>

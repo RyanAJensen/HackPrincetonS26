@@ -14,6 +14,49 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
 
 // --- Types (mirrors backend Pydantic models) ---
 
+export interface HospitalCapacity {
+  name: string;
+  available_beds?: number | null;
+  total_beds?: number | null;
+  status: string;
+  specialty?: string | null;
+  distance_mi?: number | null;
+  eta_min?: number | null;
+}
+
+export interface FacilityAssignment {
+  hospital: string;
+  patients_assigned: number;
+  capacity_strain: "normal" | "elevated" | "critical";
+  patient_types: string[];
+  routing_reason: string;
+  reroute_trigger: string;
+}
+
+export interface PatientFlowSummary {
+  total_incoming: number;
+  critical: number;
+  moderate: number;
+  minor: number;
+  facility_assignments: FacilityAssignment[];
+  bottlenecks: string[];
+  distribution_rationale: string;
+}
+
+export interface DecisionPoint {
+  decision: string;
+  reason: string;
+  assumption: string;
+  replan_trigger: string;
+}
+
+export interface Tradeoff {
+  description: string;
+  option_a: string;
+  option_b: string;
+  recommendation: string;
+}
+
 export interface MedicalImpact {
   affected_population: string;
   estimated_injured: string;
@@ -62,6 +105,7 @@ export interface Incident {
   location: string;
   severity_hint?: SeverityLevel;
   resources: Resource[];
+  hospital_capacities: HospitalCapacity[];
   status: IncidentStatus;
   current_plan_version: number;
 }
@@ -144,7 +188,12 @@ export interface PlanVersion {
   confidence_score: number;
   risk_notes: string[];
 
-  // IAP Section 9 — Medical Triage
+  // Patient flow & facility routing decisions
+  patient_flow?: PatientFlowSummary | null;
+  decision_points: DecisionPoint[];
+  tradeoffs: Tradeoff[];
+
+  // Legacy triage (kept for compat)
   medical_impact?: MedicalImpact | null;
   triage_priorities: TriagePriority[];
   patient_transport?: PatientTransport | null;

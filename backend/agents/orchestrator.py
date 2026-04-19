@@ -17,15 +17,17 @@ Phase 3 runs Operations Planner first, then Communications.
 from __future__ import annotations
 import asyncio
 import json
+import os
 import time
 import traceback as _traceback
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from models.incident import Incident
 from models.plan import (
     PlanVersion, PlanDiff, ActionItem, CommunicationDraft, Assumption,
     MedicalImpact, TriagePriority, PatientTransport,
+    PatientFlowSummary, FacilityAssignment, DecisionPoint, Tradeoff,
 )
 from models.agent import AgentFailure, AgentRun, AgentType, AgentStatus
 from agents.specialist_agents import (
@@ -37,6 +39,13 @@ from agents.specialist_agents import (
     run_incident_parser_reduced,
     run_risk_assessor,
     run_risk_assessor_reduced,
+    run_lean_parser,
+    run_lean_risk,
+    run_lean_planner,
+    run_coordination_engine,
+    run_lean_comms,
+    _fmt_situation_compact,
+    _fmt_risk_compact,
 )
 from agents.llm import call_llm
 from agents.prompts import REPLAN_CONTEXT_PROMPT
@@ -160,6 +169,57 @@ def _parse_triage_priorities(raw: list | None) -> list[TriagePriority]:
     return result
 
 
+def _parse_patient_flow(raw: dict | None) -> PatientFlowSummary | None:
+    if not raw or not isinstance(raw, dict):
+        return None
+    assignments = []
+    for fa in raw.get("facility_assignments", []):
+        if isinstance(fa, dict):
+            assignments.append(FacilityAssignment(
+                hospital=fa.get("hospital", ""),
+                patients_assigned=int(fa.get("patients_assigned", 0)),
+                capacity_strain=fa.get("capacity_strain", "normal"),
+                patient_types=fa.get("patient_types", []),
+                routing_reason=fa.get("routing_reason", ""),
+                reroute_trigger=fa.get("reroute_trigger", ""),
+            ))
+    return PatientFlowSummary(
+        total_incoming=int(raw.get("total_incoming", 0)),
+        critical=int(raw.get("critical", 0)),
+        moderate=int(raw.get("moderate", 0)),
+        minor=int(raw.get("minor", 0)),
+        facility_assignments=assignments,
+        bottlenecks=raw.get("bottlenecks", []),
+        distribution_rationale=raw.get("distribution_rationale", ""),
+    )
+
+
+def _parse_decision_points(raw: list | None) -> list[DecisionPoint]:
+    result = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            result.append(DecisionPoint(
+                decision=item.get("decision", ""),
+                reason=item.get("reason", ""),
+                assumption=item.get("assumption", ""),
+                replan_trigger=item.get("replan_trigger", ""),
+            ))
+    return result
+
+
+def _parse_tradeoffs(raw: list | None) -> list[Tradeoff]:
+    result = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            result.append(Tradeoff(
+                description=item.get("description", ""),
+                option_a=item.get("option_a", ""),
+                option_b=item.get("option_b", ""),
+                recommendation=item.get("recommendation", ""),
+            ))
+    return result
+
+
 def _parse_patient_transport(raw: dict | None) -> PatientTransport | None:
     if not raw or not isinstance(raw, dict):
         return None
@@ -170,6 +230,163 @@ def _parse_patient_transport(raw: dict | None) -> PatientTransport | None:
         constraints=raw.get("constraints", []),
         fallback_if_primary_unavailable=str(raw.get("fallback_if_primary_unavailable", "")),
     )
+
+
+def _lean_parser_to_parsed(lean: dict) -> dict:
+    """Map LeanParserOutput → structure expected by downstream agents."""
+    return {
+        "incoming_patient_count": lean.get("patient_count", 0),
+        "critical": lean.get("critical", 0),
+        "moderate": lean.get("moderate", 0),
+        "minor": lean.get("minor", 0),
+        "affected_population": lean.get("affected_population", "Unknown"),
+        "key_hazards": lean.get("hazards", []),
+        "transport_status": lean.get("transport_note", ""),
+        "hospital_capacity_notes": lean.get("hospital_notes", ""),
+        "immediate_life_safety_threat": lean.get("immediate_threat", False),
+        "time_sensitivity": lean.get("time_sensitivity", "urgent"),
+        "operational_period": lean.get("operational_period", ""),
+        "confirmed_facts": [],
+        "unknowns": lean.get("unknowns", []),
+        "location_notes": "",
+        "medical_impact": {
+            "affected_population": lean.get("affected_population", ""),
+            "estimated_injured": str(lean.get("patient_count", 0)),
+            "critical": lean.get("critical", 0),
+            "moderate": lean.get("moderate", 0),
+            "minor": lean.get("minor", 0),
+            "at_risk_groups": [],
+        },
+    }
+
+
+def _lean_risk_to_risk(lean: dict) -> dict:
+    """Map LeanRiskOutput → structure expected by downstream agents."""
+    return {
+        "severity_level": lean.get("severity", "medium"),
+        "confidence": 0.7,
+        "primary_risks": lean.get("top_risks", []),
+        "capacity_bottlenecks": lean.get("bottlenecks", []),
+        "replan_triggers": lean.get("replan_triggers", []),
+        "incident_objectives": [],
+        "safety_considerations": [],
+        "healthcare_risks": lean.get("top_risks", []),
+        "weather_driven_threats": [],
+        "resource_adequacy": lean.get("resource_adequacy", "strained"),
+        "resource_gaps": [],
+        "mutual_aid_needed": lean.get("mutual_aid_needed", False),
+        "estimated_duration_hours": 2.0,
+        "decision_triggers": [],
+        "transport_delays": [],
+        "cascade_risks": [],
+    }
+
+
+def _lean_planner_to_plan_raw(lean: dict) -> dict:
+    """Map LeanPlannerOutput → structure expected by PlanVersion builder."""
+    facility_assignments = [
+        {
+            "hospital": f.get("hospital", ""),
+            "patients_assigned": f.get("patients", 0),
+            "capacity_strain": f.get("strain", "normal"),
+            "patient_types": [],
+            "routing_reason": f.get("reason", ""),
+            "reroute_trigger": "",
+        }
+        for f in lean.get("facility_assignments", [])
+    ]
+    total = lean.get("total_patients", 0)
+    return {
+        "incident_summary": lean.get("summary", ""),
+        "patient_flow": {
+            "total_incoming": total,
+            "critical": lean.get("critical", 0),
+            "moderate": lean.get("moderate", 0),
+            "minor": lean.get("minor", 0),
+            "distribution_rationale": lean.get("distribution_note", ""),
+            "bottlenecks": [],
+            "facility_assignments": facility_assignments,
+        },
+        "operational_priorities": lean.get("priorities", []),
+        "immediate_actions": [{"description": a, "assigned_to": "Operations", "timeframe": "0-10 min"} for a in lean.get("immediate_actions", [])],
+        "short_term_actions": [{"description": a, "assigned_to": "Operations", "timeframe": "10-30 min"} for a in lean.get("short_term_actions", [])],
+        "ongoing_actions": [],
+        "decision_points": [{"decision": lean.get("key_decision", ""), "reason": "", "assumption": "", "replan_trigger": lean.get("replan_if", "")}] if lean.get("key_decision") else [],
+        "tradeoffs": [],
+        "triage_priorities": _build_lean_triage(lean),
+        "patient_transport": {
+            "primary_facilities": [f.get("hospital", "") for f in lean.get("facility_assignments", [])[:2]],
+            "alternate_facilities": [],
+            "transport_routes": [lean.get("primary_route", "")] if lean.get("primary_route") else [],
+            "constraints": [],
+        },
+        "primary_access_route": lean.get("primary_route"),
+        "alternate_access_route": lean.get("alternate_route"),
+        "assumptions": [],
+        "missing_information": lean.get("missing_info", []),
+        "resource_assignments": {"operations": [], "logistics": [], "communications": [], "command": []},
+    }
+
+
+def _build_lean_triage(lean: dict) -> list[dict]:
+    result = []
+    if lean.get("triage_critical_action") and lean.get("critical", 0) > 0:
+        result.append({"priority": 1, "label": "critical", "estimated_count": lean["critical"], "required_action": lean["triage_critical_action"], "required_response": "immediate"})
+    if lean.get("triage_moderate_action") and lean.get("moderate", 0) > 0:
+        result.append({"priority": 2, "label": "urgent", "estimated_count": lean["moderate"], "required_action": lean["triage_moderate_action"], "required_response": "urgent"})
+    if lean.get("triage_minor_action") and lean.get("minor", 0) > 0:
+        result.append({"priority": 3, "label": "minor", "estimated_count": lean["minor"], "required_action": lean["triage_minor_action"], "required_response": "monitoring"})
+    return result
+
+
+def _lean_coord_to_plan_raw(lean: dict) -> dict:
+    """Map LeanCoordinationOutput → plan_raw structure."""
+    facility_assignments = [
+        {
+            "hospital": f.get("hospital", ""),
+            "patients_assigned": f.get("patients", 0),
+            "capacity_strain": f.get("strain", "normal"),
+            "patient_types": [],
+            "routing_reason": f.get("reason", ""),
+            "reroute_trigger": "",
+        }
+        for f in lean.get("facility_assignments", [])
+    ]
+    return {
+        "incident_summary": lean.get("summary", ""),
+        "patient_flow": {
+            "total_incoming": lean.get("patient_count", 0),
+            "critical": lean.get("critical", 0),
+            "moderate": lean.get("moderate", 0),
+            "minor": lean.get("minor", 0),
+            "distribution_rationale": "",
+            "bottlenecks": lean.get("bottlenecks", []),
+            "facility_assignments": facility_assignments,
+        },
+        "operational_priorities": lean.get("priorities", []),
+        "immediate_actions": [{"description": a, "assigned_to": "Operations", "timeframe": "0-10 min"} for a in lean.get("immediate_actions", [])],
+        "short_term_actions": [],
+        "ongoing_actions": [],
+        "decision_points": [{"decision": lean.get("key_decision", ""), "reason": "", "assumption": "", "replan_trigger": lean.get("replan_if", "")}] if lean.get("key_decision") else [],
+        "tradeoffs": [],
+        "triage_priorities": [],
+        "patient_transport": {"primary_facilities": [f.get("hospital", "") for f in lean.get("facility_assignments", [])[:2]], "alternate_facilities": [], "transport_routes": [], "constraints": []},
+        "primary_access_route": None,
+        "alternate_access_route": None,
+        "assumptions": [],
+        "missing_information": lean.get("missing_info", []),
+        "resource_assignments": {"operations": [], "logistics": [], "communications": [], "command": []},
+    }
+
+
+def _lean_comms_to_comms(lean: dict) -> dict:
+    """Map LeanCommunicationsOutput → CommunicationsOutput-compatible dict."""
+    return {
+        "ems_brief": {"audience": "EMS dispatch", "channel": "radio", "urgency": "immediate", "body": lean.get("ems_brief", "")},
+        "hospital_notification": {"audience": "receiving hospitals", "channel": "hospital_radio", "urgency": "immediate", "subject": "INCOMING PATIENTS", "body": lean.get("hospital_notification", "")},
+        "public_advisory": {"audience": "public", "channel": "emergency_alert", "urgency": "immediate", "subject": "EMERGENCY ADVISORY", "body": lean.get("public_advisory", "")},
+        "administration_update": {"audience": "hospital command center", "channel": "email", "urgency": "normal", "subject": "SURGE STATUS", "body": lean.get("admin_update", "")},
+    }
 
 
 def _all_actions(plan: PlanVersion) -> list[ActionItem]:
@@ -205,7 +422,7 @@ def _generate_diff(prev: PlanVersion, curr: PlanVersion) -> PlanDiff:
     return PlanDiff(
         from_version=prev.version,
         to_version=curr.version,
-        summary=curr.diff_summary or f"IAP revised (v{prev.version} → v{curr.version})",
+        summary=curr.diff_summary or f"IAP revised (v{prev.version} to v{curr.version})",
         changed_sections=changed_sections or ["general"],
         added_actions=added,
         removed_actions=removed,
@@ -333,7 +550,7 @@ def _fallback_plan_raw(parsed: dict, risk: dict, ext_ctx: dict, resources_raw: l
             "communications": communications,
             "command": command,
         },
-        "primary_access_route": " → ".join((routing.get("primary_route_steps") or [])[:3]) or "Use safest confirmed primary corridor",
+        "primary_access_route": " > ".join((routing.get("primary_route_steps") or [])[:3]) or "Use safest confirmed primary corridor",
         "alternate_access_route": "Use alternate corridor if flooding or blockage affects primary route",
         "assumptions": [
             {"description": "Primary access remains usable for EMS units", "impact": "If false, reroute transport immediately", "confidence": 0.4},
@@ -530,22 +747,22 @@ def _print_swarm_truth(agent_runs: list[AgentRun], elapsed_ms: int) -> None:
     elif len(dedalus) == len(agent_runs):
         status = f"OK — all {len(dedalus)} agents via DedalusRunner ({elapsed_ms}ms)"
     elif local and not dedalus and not swarm:
-        status = f"LOCAL — {len(local)} agents used K2 only ({elapsed_ms}ms)"
+        status = f"LOCAL - {len(local)} agents used K2 only ({elapsed_ms}ms)"
     else:
         status = f"MIXED — {runtime_summary} ({elapsed_ms}ms)"
 
-    print(f"\n{'─'*60}")
+    print(f"\n{'-'*60}")
     print(f"  Dedalus: {status}")
     print(f"  Per-agent:")
     for run in agent_runs:
         role = AGENT_ROLE_MAP.get(run.agent_type, "?")
         label = ROLE_LABELS.get(role, role)
-        ok = "✓" if run.status == AgentStatus.COMPLETED else "✗"
+        ok = "OK" if run.status == AgentStatus.COMPLETED else "!!"
         print(
             f"    {ok} {run.agent_type:<22} runtime={run.runtime:<10} {label} "
             f"{_format_run_metadata(run)}"
         )
-    print(f"{'─'*60}\n")
+    print(f"{'-'*60}\n")
 
 
 def _raise_if_required_agent_failed(run: AgentRun, agent_runs: list[AgentRun], started_at: float) -> None:
@@ -559,18 +776,223 @@ def _raise_if_required_agent_failed(run: AgentRun, agent_runs: list[AgentRun], s
     raise RuntimeError(f"{label} failed ({run.agent_type}, runtime={run.runtime}): {detail}")
 
 
+def _build_ext_summary(ext_ctx: dict, runtime: Any, risk: dict) -> dict:
+    weather = ext_ctx.get("weather", {})
+    mapping = ext_ctx.get("mapping", {})
+    fema = ext_ctx.get("fema", {})
+    geo = mapping.get("geocode")
+    routing = mapping.get("routing")
+    hospitals = mapping.get("hospitals", [])
+    alerts = weather.get("alerts", [])
+    forecast = weather.get("forecast")
+    return {
+        "geocoded": bool(geo),
+        "coordinates": ext_ctx.get("coordinates"),
+        "display_address": geo.get("display_address") if geo else None,
+        "weather_alerts": [{"event": a["event"], "severity": a["severity"], "headline": a["headline"][:100]} for a in alerts[:3]],
+        "alert_count": len(alerts),
+        "forecast": {"temperature_f": forecast.get("temperature_f"), "short_forecast": forecast.get("short_forecast"), "wind_speed": forecast.get("wind_speed")} if forecast else None,
+        "weather_risk": weather.get("risk", {}).get("severity", "none"),
+        "routing": {"duration_min": routing.get("primary_duration_min"), "distance_mi": routing.get("primary_distance_mi"), "steps": (routing.get("primary_route_steps") or [])[:3], "origin": routing.get("origin")} if routing else None,
+        "fema_context": fema.get("context_notes", [])[:2],
+        "weather_driven_threats": risk.get("weather_driven_threats", []),
+        "replan_triggers": risk.get("replan_triggers", []),
+        "healthcare_risks": risk.get("healthcare_risks", []),
+        "hospitals": [{"name": h.get("name", ""), "distance_mi": h.get("distance_mi"), "trauma_level": h.get("trauma_level")} for h in hospitals[:4]],
+        "dedalus_execution": {"dedalus": "DedalusRunner", "swarm": "Dedalus Machines", "local": "local"}.get(runtime.runtime_name(), runtime.runtime_name()),
+    }
+
+
+def _build_plan_version(
+    incident: Any, version: int, update_text: Optional[str],
+    parsed: dict, risk: dict, plan_raw: dict,
+    comms_artifact: dict, diff_summary: Optional[str], changed_sections: Optional[list],
+    ext_summary: dict,
+) -> "PlanVersion":
+    return PlanVersion(
+        incident_id=incident.id,
+        version=version,
+        trigger=update_text or "initial",
+        incident_summary=plan_raw.get("incident_summary", ""),
+        operational_period=parsed.get("operational_period", ""),
+        incident_objectives=risk.get("incident_objectives", []),
+        operational_priorities=plan_raw.get("operational_priorities", []),
+        immediate_actions=_parse_action_items(plan_raw.get("immediate_actions", [])),
+        short_term_actions=_parse_action_items(plan_raw.get("short_term_actions", [])),
+        ongoing_actions=_parse_action_items(plan_raw.get("ongoing_actions", [])),
+        resource_assignments=plan_raw.get("resource_assignments"),
+        safety_considerations=risk.get("safety_considerations", []),
+        communications=_parse_communications(comms_artifact),
+        confirmed_facts=parsed.get("confirmed_facts", []),
+        unknowns=parsed.get("unknowns", []),
+        assumptions=_parse_assumptions(plan_raw.get("assumptions", [])),
+        missing_information=plan_raw.get("missing_information", []),
+        assessed_severity=risk.get("severity_level", risk.get("severity", "unknown")),
+        confidence_score=float(risk.get("confidence", 0.7)),
+        risk_notes=risk.get("primary_risks", risk.get("top_risks", [])),
+        patient_flow=_parse_patient_flow(plan_raw.get("patient_flow")),
+        decision_points=_parse_decision_points(plan_raw.get("decision_points")),
+        tradeoffs=_parse_tradeoffs(plan_raw.get("tradeoffs")),
+        medical_impact=_parse_medical_impact(parsed.get("medical_impact"), parsed),
+        triage_priorities=_parse_triage_priorities(plan_raw.get("triage_priorities")),
+        patient_transport=_parse_patient_transport(plan_raw.get("patient_transport")),
+        diff_summary=diff_summary,
+        changed_sections=changed_sections,
+        external_context=ext_summary,
+    )
+
+
+async def generate_plan_fast(
+    incident: Incident,
+    version: int,
+    update_text: Optional[str] = None,
+    previous_plan: Optional[PlanVersion] = None,
+) -> tuple[PlanVersion, list[AgentRun]]:
+    """
+    Fast Mode: 2 agents total.
+    Phase 1 (parallel): CoordinationEngine + external context
+    Phase 2: Lean Communications
+    Target: <25s total.
+    """
+    runtime = get_runtime()
+    agent_runs: list[AgentRun] = []
+    resources_raw = [r.model_dump() for r in incident.resources]
+    hospital_capacities_raw = [h.model_dump() for h in incident.hospital_capacities]
+    t_pipeline = time.monotonic()
+
+    print(f"\n[{datetime.utcnow().strftime('%H:%M:%S')}] === FAST MODE ANALYZE incident={incident.id[:8]} v{version} ===")
+
+    full_report = incident.report if not update_text else f"{incident.report}\n\nFIELD UPDATE: {update_text}"
+
+    def _elapsed(t: float) -> str:
+        return f"{int((time.monotonic() - t) * 1000)}ms"
+
+    # Phase 1: CoordinationEngine + external context (parallel)
+    t1 = time.monotonic()
+    run1 = _make_run(incident, version, AgentType.ACTION_PLANNER, {
+        "incident_type": incident.incident_type,
+        "report": full_report,
+        "location": incident.location,
+        "severity_hint": incident.severity_hint,
+        "resources": resources_raw,
+        "hospital_capacities": hospital_capacities_raw,
+        "external_context": {},
+    })
+
+    run1, ext_ctx = await asyncio.gather(
+        runtime.execute(run1, run_coordination_engine),
+        gather_external_context(incident.location),
+    )
+    run1.input_snapshot = {**(run1.input_snapshot or {}), "external_context": ext_ctx}
+
+    if run1.status == AgentStatus.FAILED:
+        run1.degraded = True
+        run1.fallback_used = True
+        run1.output_artifact = _fallback_plan_raw({}, {}, ext_ctx, resources_raw, incident.location)
+        run1.log_entries.append("Coordination engine failed; using fallback")
+        save_agent_run(run1)
+
+    agent_runs.append(run1)
+    coord_raw = run1.output_artifact or {}
+    if run1.fallback_used:
+        plan_raw = coord_raw
+    else:
+        plan_raw = _lean_coord_to_plan_raw(coord_raw)
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] coordination engine done ({_elapsed(t1)})")
+
+    # Phase 2: Lean Communications
+    t2 = time.monotonic()
+    facility_strs = [
+        f"{f.get('hospital', '')} ({f.get('patients_assigned', 0)} pts)"
+        for f in plan_raw.get("patient_flow", {}).get("facility_assignments", [])[:3]
+    ]
+    run2 = _make_run(incident, version, AgentType.COMMUNICATIONS, {
+        "situation_summary": (
+            f"{incident.incident_type} at {incident.location}. "
+            f"Patients: {coord_raw.get('patient_count', 0)} "
+            f"(critical:{coord_raw.get('critical', 0)} moderate:{coord_raw.get('moderate', 0)} minor:{coord_raw.get('minor', 0)}). "
+            f"Risks: {'; '.join(coord_raw.get('top_risks', [])[:2])}."
+        ),
+        "incident_summary": plan_raw.get("incident_summary", ""),
+        "severity": coord_raw.get("severity", "high"),
+        "location": incident.location,
+        "priorities": plan_raw.get("operational_priorities", []),
+        "plan_data": {**coord_raw, "facility_assignments": coord_raw.get("facility_assignments", [])},
+        "external_context": ext_ctx,
+    })
+
+    if run1.fallback_used:
+        run2.output_artifact = await run_communications_fallback(run2)
+        run2.status = AgentStatus.COMPLETED
+        run2.degraded = True
+        run2.fallback_used = True
+        run2.runtime = runtime.runtime_name()
+        run2.started_at = run2.completed_at = datetime.utcnow()
+        run2.latency_ms = 0
+        save_agent_run(run2)
+    else:
+        run2 = await runtime.execute(run2, run_lean_comms)
+        if run2.status == AgentStatus.FAILED:
+            run2.degraded = True
+            run2.fallback_used = True
+            run2.output_artifact = await run_communications_fallback(run2)
+            save_agent_run(run2)
+
+    agent_runs.append(run2)
+    comms_raw = run2.output_artifact or {}
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] communications done ({_elapsed(t2)})")
+
+    # Map comms output
+    if "ems_brief" in comms_raw and isinstance(comms_raw["ems_brief"], str):
+        comms_artifact = _lean_comms_to_comms(comms_raw)
+    else:
+        comms_artifact = comms_raw
+
+    # Build diff context if replanning
+    diff_summary = None
+    changed_sections = None
+    if update_text and previous_plan:
+        try:
+            replan_meta = await call_llm(REPLAN_CONTEXT_PROMPT.format(
+                original_summary=previous_plan.incident_summary,
+                original_priorities=json.dumps(previous_plan.operational_priorities),
+                update_text=update_text,
+            ), caller="replan_context", response_model=ReplanContextOutput)
+            diff_summary = replan_meta.get("reasoning", "")
+            changed_sections = replan_meta.get("affected_sections", [])
+        except Exception:
+            diff_summary = f"Plan revised: {update_text}"
+
+    ext_summary = _build_ext_summary(ext_ctx, runtime, {})
+    parsed = _lean_parser_to_parsed(coord_raw)
+    risk = _lean_risk_to_risk(coord_raw)
+
+    plan = _build_plan_version(
+        incident, version, update_text, parsed, risk, plan_raw,
+        comms_artifact, diff_summary, changed_sections, ext_summary,
+    )
+
+    elapsed_ms = int((time.monotonic() - t_pipeline) * 1000)
+    _print_swarm_truth(agent_runs, elapsed_ms)
+    return plan, agent_runs
+
+
 async def generate_plan(
     incident: Incident,
     version: int,
     update_text: Optional[str] = None,
     previous_plan: Optional[PlanVersion] = None,
 ) -> tuple[PlanVersion, list[AgentRun]]:
+    fast_mode = os.environ.get("FAST_MODE", "1") not in ("0", "false", "no")
+    if fast_mode:
+        return await generate_plan_fast(incident, version, update_text, previous_plan)
+
     runtime = get_runtime()
     agent_runs: list[AgentRun] = []
     resources_raw = [r.model_dump() for r in incident.resources]
     t_pipeline = time.monotonic()
 
-    print(f"\n[{datetime.utcnow().strftime('%H:%M:%S')}] ═══ START ANALYZE incident={incident.id[:8]} v{version} ═══")
+    print(f"\n[{datetime.utcnow().strftime('%H:%M:%S')}] === START ANALYZE incident={incident.id[:8]} v{version} ===")
     runtime_label = {
         "local": "local (K2 only)",
         "dedalus": "dedalus (DedalusRunner)",
@@ -587,129 +1009,78 @@ async def generate_plan(
         return f"{run.latency_ms if run.latency_ms is not None else 0}ms"
 
     # ═══════════════════════════════════════════════════════════
-    # PHASE 1 (parallel)
-    # Situation Unit machine: incident_parser
-    # External enrichment: geocode + weather + FEMA + routing
+    # PHASE 1 (parallel): Lean Situation + external context
     # ═══════════════════════════════════════════════════════════
-    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ── PHASE 1: Situation Unit + external context (parallel) ──")
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] -- PHASE 1: Situation Unit + external context (parallel) --")
     t1 = time.monotonic()
 
+    hospital_capacities_raw = [h.model_dump() for h in incident.hospital_capacities]
     run1 = _make_run(incident, version, AgentType.INCIDENT_PARSER, {
         "incident_type": incident.incident_type,
-        "report": full_report,
+        "report": full_report[:1500],
         "location": incident.location,
         "severity_hint": incident.severity_hint,
         "resources": resources_raw,
+        "hospital_capacities": hospital_capacities_raw,
         "external_context": {},
     })
 
     run1, ext_ctx = await asyncio.gather(
-        runtime.execute(run1, run_incident_parser),
+        runtime.execute(run1, run_lean_parser),
         gather_external_context(incident.location),
     )
     run1.input_snapshot = {**(run1.input_snapshot or {}), "external_context": ext_ctx}
-    if run1.status == AgentStatus.FAILED and run1.error_kind == "timeout":
-        print(
-            f"[{datetime.utcnow().strftime('%H:%M:%S')}] incident_parser timeout; "
-            "retrying once with reduced prompt"
-        )
-        run1.retry_count = max(run1.retry_count, 1)
-        run1.degraded = True
-        run1.input_snapshot = {**(run1.input_snapshot or {}), "prompt_mode": "reduced"}
-        run1.log_entries.append("Retrying once with reduced situation-unit prompt after timeout")
-        run1 = await runtime.execute(run1, run_incident_parser_reduced)
     if run1.status == AgentStatus.FAILED:
         run1.degraded = True
         run1.fallback_used = True
-        run1.output_artifact = _fallback_incident_parse(incident, ext_ctx)
-        run1.log_entries.append("Situation parse degraded; using deterministic fallback incident parse")
+        run1.output_artifact = _lean_parser_to_parsed(_fallback_incident_parse(incident, ext_ctx))
+        run1.log_entries.append("Situation parse failed; using fallback")
         save_agent_run(run1)
     agent_runs.append(run1)
-    parsed = run1.output_artifact or {}
+    lean_parsed = run1.output_artifact or {}
+    parsed = _lean_parser_to_parsed(lean_parsed) if lean_parsed.get("patient_count") is not None else lean_parsed
 
     _log_agent_outcome(run1, label="incident_parser", elapsed=_elapsed(t1))
     _raise_if_required_agent_failed(run1, agent_runs, t_pipeline)
 
     # ═══════════════════════════════════════════════════════════
-    # PHASE 2 / 3a
-    # Threat analysis is optional, so planner starts immediately with a conservative risk seed.
-    # This removes risk_assessor from the critical path.
+    # PHASE 2 / 3a: Lean Risk + Lean Planner (parallel)
+    # Risk gets compact situation summary only.
+    # Planner gets compact situation + compact risk.
     # ═══════════════════════════════════════════════════════════
-    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ── PHASE 2/3a: Threat Analysis + Operations Planner (parallel) ──")
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] -- PHASE 2/3a: Lean Risk + Lean Planner (parallel) --")
     t23 = time.monotonic()
 
+    fallback_risk = _fallback_risk_context(parsed, ext_ctx, "pending threat analysis")
     run2 = _make_run(incident, version, AgentType.RISK_ASSESSOR, {
         "parsed_data": parsed,
-        "resources": resources_raw,
         "external_context": ext_ctx,
     })
     run3 = _make_run(incident, version, AgentType.ACTION_PLANNER, {
         "parsed_data": parsed,
-        "risk_data": _planner_risk_context(_fallback_risk_context(parsed, ext_ctx, "pending threat analysis")),
-        "resources": resources_raw,
+        "risk_data": fallback_risk,
         "location": incident.location,
+        "hospital_capacities": hospital_capacities_raw,
         "external_context": ext_ctx,
     })
 
     async def _execute_risk() -> AgentRun:
-        local_run2 = await runtime.execute(run2, run_risk_assessor)
-        if local_run2.status == AgentStatus.FAILED and local_run2.error_kind == "timeout":
-            print(
-                f"[{datetime.utcnow().strftime('%H:%M:%S')}] risk_assessor timeout; "
-                "retrying once with reduced prompt"
-            )
-            local_run2.retry_count = max(local_run2.retry_count, 1)
-            local_run2.degraded = True
-            local_run2.input_snapshot = {**(local_run2.input_snapshot or {}), "prompt_mode": "reduced"}
-            local_run2.log_entries.append("Retrying once with reduced threat-analysis prompt after timeout")
-            local_run2 = await runtime.execute(local_run2, run_risk_assessor_reduced)
-            if local_run2.status == AgentStatus.COMPLETED:
-                local_run2.degraded = True
-                local_run2.fallback_used = True
-                save_agent_run(local_run2)
-
+        local_run2 = await runtime.execute(run2, run_lean_risk)
         if local_run2.status == AgentStatus.FAILED:
             local_run2.degraded = True
             local_run2.fallback_used = True
-            failure_reason = local_run2.error_kind or "failure"
-            local_run2.output_artifact = _fallback_risk_context(parsed, ext_ctx, failure_reason)
-            local_run2.log_entries.append(
-                f"Threat analysis degraded; using fallback risk context after {failure_reason}"
-            )
+            local_run2.output_artifact = _fallback_risk_context(parsed, ext_ctx, local_run2.error_kind or "failure")
+            local_run2.log_entries.append("Lean risk assessor failed; using fallback")
             save_agent_run(local_run2)
         return local_run2
 
     async def _execute_planner() -> AgentRun:
-        local_run3 = await runtime.execute(run3, run_action_planner)
-        if local_run3.status == AgentStatus.FAILED and local_run3.error_kind == "timeout":
-            print(
-                f"[{datetime.utcnow().strftime('%H:%M:%S')}] action_planner timeout; "
-                "retrying once with reduced prompt"
-            )
-            local_run3.retry_count = max(local_run3.retry_count, 1)
-            local_run3.degraded = True
-            local_run3.input_snapshot = {**(local_run3.input_snapshot or {}), "prompt_mode": "reduced"}
-            local_run3.log_entries.append("Retrying once with reduced operations-planner prompt after timeout")
-            local_run3 = await runtime.execute(local_run3, run_action_planner_reduced)
-            if local_run3.status == AgentStatus.COMPLETED:
-                local_run3.degraded = True
-                local_run3.fallback_used = True
-                save_agent_run(local_run3)
-
+        local_run3 = await runtime.execute(run3, run_lean_planner)
         if local_run3.status == AgentStatus.FAILED:
             local_run3.degraded = True
             local_run3.fallback_used = True
-            failure_reason = local_run3.error_kind or "failure"
-            local_run3.output_artifact = _fallback_plan_raw(
-                parsed,
-                {},
-                ext_ctx,
-                resources_raw,
-                incident.location,
-            )
-            local_run3.log_entries.append(
-                f"Operations plan degraded; using deterministic fallback plan after {failure_reason}"
-            )
+            local_run3.output_artifact = _fallback_plan_raw(parsed, {}, ext_ctx, resources_raw, incident.location)
+            local_run3.log_entries.append("Lean planner failed; using fallback")
             save_agent_run(local_run3)
         return local_run3
 
@@ -717,31 +1088,22 @@ async def generate_plan(
 
     agent_runs.append(run3)
     agent_runs.insert(1, run2)
-    risk = run2.output_artifact or {}
-    plan_raw = run3.output_artifact or {}
+    lean_risk = run2.output_artifact or {}
+    lean_plan = run3.output_artifact or {}
+    risk = _lean_risk_to_risk(lean_risk) if "severity" in lean_risk else lean_risk
+    plan_raw = _lean_planner_to_plan_raw(lean_plan) if "immediate_actions" in lean_plan and isinstance(lean_plan.get("immediate_actions", [None])[0] if lean_plan.get("immediate_actions") else [None], str) else lean_plan
     _log_agent_outcome(run2, label="risk_assessor", elapsed=_run_elapsed(run2))
     _log_agent_outcome(run3, label="action_planner", elapsed=_run_elapsed(run3))
 
-    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ── PHASE 3b: Communications Officer — EMS / hospital / public ──")
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] -- PHASE 3b: Communications (lean) --")
     t3 = time.monotonic()
-    preliminary_summary = (
-        f"{incident.incident_type} at {incident.location}. "
-        f"Affected: {parsed.get('affected_population', 'unknown')}. "
-        + (f"Injuries: {parsed.get('medical_impact', {}).get('estimated_injured', 'unknown')}. " if parsed.get("medical_impact") else "")
-        + f"Hazards: {', '.join(parsed.get('key_hazards', [])[:3])}."
-    )
     run4 = _make_run(incident, version, AgentType.COMMUNICATIONS, {
-        "incident_summary": plan_raw.get("incident_summary") or preliminary_summary,
-        "severity": risk.get("severity_level", "unknown"),
+        "situation_summary": _fmt_situation_compact(parsed),
+        "incident_summary": plan_raw.get("incident_summary", ""),
+        "severity": risk.get("severity_level", risk.get("severity", "unknown")),
         "location": incident.location,
-        "priorities": (
-            plan_raw.get("operational_priorities")
-            or risk.get("incident_objectives", [])
-            or ["Use parser facts and conservative assumptions until threat analysis is available"]
-        ),
-        "missing_info": parsed.get("unknowns", []),
-        "triage_priorities": plan_raw.get("triage_priorities", []),
-        "patient_transport": plan_raw.get("patient_transport"),
+        "priorities": plan_raw.get("operational_priorities", []),
+        "plan_data": lean_plan,
         "external_context": ext_ctx,
     })
     if run3.fallback_used:
@@ -749,27 +1111,25 @@ async def generate_plan(
         run4.started_at = datetime.utcnow()
         run4.output_artifact = await run_communications_fallback(run4)
         run4.completed_at = datetime.utcnow()
-        run4.latency_ms = max(int((run4.completed_at - run4.started_at).total_seconds() * 1000), 0)
+        run4.latency_ms = 0
         run4.status = AgentStatus.COMPLETED
         run4.degraded = True
         run4.fallback_used = True
-        run4.log_entries.append("Used deterministic communications fallback because planner was degraded")
         save_agent_run(run4)
     else:
-        run4 = await runtime.execute(run4, run_communications_agent)
+        run4 = await runtime.execute(run4, run_lean_comms)
         if run4.status == AgentStatus.FAILED:
             run4.degraded = True
             run4.fallback_used = True
             run4.output_artifact = await run_communications_fallback(run4)
-            run4.log_entries.append("Communications timed out; returning deterministic fallback messages")
             save_agent_run(run4)
     agent_runs.append(run4)
-    comms = run4.output_artifact or {}
+    comms_raw4 = run4.output_artifact or {}
+    if "ems_brief" in comms_raw4 and isinstance(comms_raw4.get("ems_brief"), str):
+        comms_raw4 = _lean_comms_to_comms(comms_raw4)
     _log_agent_outcome(run4, label="communications", elapsed=_run_elapsed(run4))
-
     print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] PHASE 3 done ({_elapsed(t3)})")
 
-    # --- Diff context for replanning ---
     diff_summary = None
     changed_sections = None
     if update_text and previous_plan:
@@ -782,95 +1142,17 @@ async def generate_plan(
             diff_summary = replan_meta.get("reasoning", "")
             changed_sections = replan_meta.get("affected_sections", [])
         except Exception:
-            diff_summary = f"IAP revised based on field update: {update_text}"
+            diff_summary = f"Plan revised: {update_text}"
 
-    # --- External context summary for frontend ---
-    weather = ext_ctx.get("weather", {})
-    mapping = ext_ctx.get("mapping", {})
-    fema = ext_ctx.get("fema", {})
-    geo = mapping.get("geocode")
-    routing = mapping.get("routing")
-    hospitals = mapping.get("hospitals", [])
-    alerts = weather.get("alerts", [])
-    forecast = weather.get("forecast")
+    ext_summary = _build_ext_summary(ext_ctx, runtime, risk)
+    ext_summary["primary_access_route"] = plan_raw.get("primary_access_route")
+    ext_summary["alternate_access_route"] = plan_raw.get("alternate_access_route")
 
-    ext_summary = {
-        "geocoded": bool(geo),
-        "coordinates": ext_ctx.get("coordinates"),
-        "display_address": geo.get("display_address") if geo else None,
-        "weather_alerts": [
-            {"event": a["event"], "severity": a["severity"], "headline": a["headline"][:100]}
-            for a in alerts[:3]
-        ],
-        "alert_count": len(alerts),
-        "forecast": {
-            "temperature_f": forecast.get("temperature_f") if forecast else None,
-            "short_forecast": forecast.get("short_forecast") if forecast else None,
-            "wind_speed": forecast.get("wind_speed") if forecast else None,
-        } if forecast else None,
-        "weather_risk": weather.get("risk", {}).get("severity", "none"),
-        "routing": {
-            "duration_min": routing.get("primary_duration_min") if routing else None,
-            "distance_mi": routing.get("primary_distance_mi") if routing else None,
-            "steps": (routing.get("primary_route_steps") or [])[:3] if routing else [],
-            "origin": routing.get("origin") if routing else None,
-        } if routing else None,
-        "fema_context": fema.get("context_notes", [])[:2],
-        "weather_driven_threats": risk.get("weather_driven_threats", []),
-        "replan_triggers": risk.get("replan_triggers", []),
-        "primary_access_route": plan_raw.get("primary_access_route"),
-        "alternate_access_route": plan_raw.get("alternate_access_route"),
-        "healthcare_risks": risk.get("healthcare_risks", []),
-        "hospitals": [
-            {"name": h.get("name", ""), "distance_mi": h.get("distance_mi"), "trauma_level": h.get("trauma_level")}
-            for h in hospitals[:4]
-        ],
-        "dedalus_execution": {
-            "dedalus": "DedalusRunner",
-            "swarm": "Dedalus Machines",
-            "local": "local",
-        }.get(runtime.runtime_name(), runtime.runtime_name()),
-    }
-
-    plan = PlanVersion(
-        incident_id=incident.id,
-        version=version,
-        trigger=update_text or "initial",
-
-        incident_summary=plan_raw.get("incident_summary", ""),
-        operational_period=parsed.get("operational_period", ""),
-
-        incident_objectives=risk.get("incident_objectives", []),
-        operational_priorities=plan_raw.get("operational_priorities", []),
-
-        immediate_actions=_parse_action_items(plan_raw.get("immediate_actions", [])),
-        short_term_actions=_parse_action_items(plan_raw.get("short_term_actions", [])),
-        ongoing_actions=_parse_action_items(plan_raw.get("ongoing_actions", [])),
-
-        resource_assignments=plan_raw.get("resource_assignments"),
-        safety_considerations=risk.get("safety_considerations", []),
-
-        communications=_parse_communications(comms),
-
-        confirmed_facts=parsed.get("confirmed_facts", []),
-        unknowns=parsed.get("unknowns", []),
-        assumptions=_parse_assumptions(plan_raw.get("assumptions", [])),
-        missing_information=plan_raw.get("missing_information", []),
-
-        assessed_severity=risk.get("severity_level", "unknown"),
-        confidence_score=float(risk.get("confidence", 0.7)),
-        risk_notes=risk.get("primary_risks", []),
-
-        medical_impact=_parse_medical_impact(parsed.get("medical_impact"), parsed),
-        triage_priorities=_parse_triage_priorities(plan_raw.get("triage_priorities")),
-        patient_transport=_parse_patient_transport(plan_raw.get("patient_transport")),
-
-        diff_summary=diff_summary,
-        changed_sections=changed_sections,
-        external_context=ext_summary,
+    plan = _build_plan_version(
+        incident, version, update_text, parsed, risk, plan_raw,
+        comms_raw4, diff_summary, changed_sections, ext_summary,
     )
 
     elapsed_ms = int((time.monotonic() - t_pipeline) * 1000)
     _print_swarm_truth(agent_runs, elapsed_ms)
-
     return plan, agent_runs

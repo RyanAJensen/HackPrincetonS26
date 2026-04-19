@@ -141,9 +141,26 @@ class DedalusAgentRuntime(AgentRuntime):
                 "DedalusRunner — agent completed; awaited result.final_output validated via structured output schema",
             )
         except Exception as e:
+            err_str = str(e)
+            is_auth = "401" in err_str or "invalid_api_key" in err_str or "Key inactive" in err_str
+            if is_auth:
+                from agents.dedalus_context import mark_dedalus_auth_failed
+                mark_dedalus_auth_failed()
+                print(f"[Dedalus] Auth error on {run.agent_type} — falling back to local K2")
+                dedalus_runner_ctx.reset(token)
+                token = None
+                from runtime.local_runtime import LocalAgentRuntime
+                run.status = AgentStatus.PENDING
+                run.runtime = "local"
+                run.error_message = None
+                run.error_kind = None
+                run.log_entries.append("Dedalus auth failed; retrying via local K2 runtime")
+                save_agent_run(run)
+                return await LocalAgentRuntime().execute(run, fn)
             finalize_run_failure(run, e, "DedalusRunner FAILED", traceback.format_exc())
         finally:
-            dedalus_runner_ctx.reset(token)
+            if token is not None:
+                dedalus_runner_ctx.reset(token)
 
         save_agent_run(run)
         return run

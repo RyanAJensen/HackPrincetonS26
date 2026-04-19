@@ -15,7 +15,7 @@ from db import (
     save_plan_version, get_plan_version, get_latest_plan, list_plan_versions,
     save_agent_run, list_agent_runs,
 )
-from data.seed import DEMO_SCENARIOS, CAMPUS_RESOURCES
+from data.seed import DEMO_SCENARIOS, REGIONAL_RESOURCES as CAMPUS_RESOURCES
 from runtime import get_runtime
 from runtime.dedalus_client_config import dedalus_byok_configured
 from runtime.dedalus_output import extract_final_output, validate_response_output

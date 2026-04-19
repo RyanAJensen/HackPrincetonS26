@@ -23,6 +23,9 @@ from runtime.dedalus_output import (
 
 K2_API_URL = "https://api.k2think.ai/v1/chat/completions"
 K2_MODEL = "MBZUAI-IFM/K2-Think-v2"
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_VERSION = "2023-06-01"
+ANTHROPIC_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 MAX_VALIDATION_RETRIES = 2
 
 STRICT_JSON_DIRECTIVE = (
@@ -189,6 +192,17 @@ def get_api_key() -> str:
     return _api_key
 
 
+def _use_anthropic_backend() -> bool:
+    """Prefer Claude if ANTHROPIC_API_KEY is set in local mode (much faster than K2)."""
+    backend = os.getenv("LLM_BACKEND", "").lower()
+    if backend == "k2":
+        return False
+    if backend == "anthropic":
+        return True
+    # Auto-select: prefer Anthropic if key is available
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
 def _require_response_model(
     response_model: Optional[type[BaseModel]],
 ) -> type[BaseModel]:
@@ -198,7 +212,8 @@ def _require_response_model(
 
 
 def _use_dedalus_runner_for_llm() -> bool:
-    return os.getenv("RUNTIME_MODE", "dedalus") != "local"
+    from agents.dedalus_context import is_dedalus_auth_failed
+    return os.getenv("RUNTIME_MODE", "dedalus") != "local" and not is_dedalus_auth_failed()
 
 
 def _get_runner_for_call() -> Any | None:
@@ -410,6 +425,17 @@ async def _call_dedalus_runner(
                 break
             continue
         except Exception as exc:
+            exc_str = str(exc)
+            is_auth = "401" in exc_str or "invalid_api_key" in exc_str or "Key inactive" in exc_str
+            if is_auth:
+                from agents.dedalus_context import mark_dedalus_auth_failed
+                mark_dedalus_auth_failed()
+                print(f"[LLM] Dedalus auth error ({caller}) — switching to local K2 for all calls")
+                return await _call_k2_local(
+                    prompt, system, caller,
+                    response_model=response_model,
+                    timeout_seconds=None,
+                )
             _raise_terminal_error(
                 "DedalusRunner",
                 caller,
@@ -563,6 +589,94 @@ async def _call_k2_local(
     raise AssertionError("unreachable")
 
 
+async def _call_claude_local(
+    prompt: str,
+    system: str,
+    caller: str,
+    response_model: Optional[type[BaseModel]] = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    response_model = _require_response_model(response_model)
+    sys = _build_system_prompt(system)
+    started_at = time.monotonic()
+    timeout_seconds = timeout_seconds or float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    model = os.getenv("ANTHROPIC_MODEL", ANTHROPIC_DEFAULT_MODEL)
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set; cannot use Anthropic backend")
+
+    # Embed schema in system prompt so Claude outputs valid JSON
+    schema_str = json.dumps(response_model.model_json_schema(), separators=(",", ":"))
+    full_system = f"{sys}\n\nYou MUST output valid JSON matching this schema exactly:\n{schema_str}"
+
+    payload = {
+        "model": model,
+        "max_tokens": 2048,
+        "temperature": float(os.getenv("LLM_TEMPERATURE", "0")),
+        "system": full_system,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    last_validation_error: Optional[Exception] = None
+    for attempt in range(MAX_VALIDATION_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    ANTHROPIC_API_URL,
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": ANTHROPIC_API_VERSION,
+                        "content-type": "application/json",
+                    },
+                    json=payload,
+                    timeout=timeout_seconds,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            # Extract text content from Anthropic response format
+            content_blocks = data.get("content", [])
+            raw_text = ""
+            for block in content_blocks:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    raw_text += block.get("text", "")
+            raw_text = raw_text.strip()
+
+            # Strip markdown code fences if present
+            if raw_text.startswith("```"):
+                lines = raw_text.split("\n")
+                raw_text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+            parsed = _strict_json_object(raw_text, caller, "LLM/Anthropic")
+            result = _validate_payload(parsed, response_model, caller, "LLM/Anthropic")
+            _finalize_success("LLM/Anthropic", caller, started_at, attempt)
+            return result
+        except LLMResponseValidationError as exc:
+            last_validation_error = exc
+            if attempt == MAX_VALIDATION_RETRIES:
+                break
+            continue
+        except httpx.TimeoutException as exc:
+            timeout_error = RuntimeError(f"{caller}: LLM/Anthropic timed out after {int(timeout_seconds)}s")
+            _raise_terminal_error(
+                "LLM/Anthropic", caller, started_at=started_at,
+                retry_count=attempt, kind="timeout", exc=timeout_error,
+            )
+        except Exception as exc:
+            _raise_terminal_error(
+                "LLM/Anthropic", caller, started_at=started_at,
+                retry_count=attempt, kind="runtime_error", exc=exc,
+            )
+
+    assert last_validation_error is not None
+    _raise_terminal_error(
+        "LLM/Anthropic", caller, started_at=started_at,
+        retry_count=MAX_VALIDATION_RETRIES, kind="validation_failed",
+        exc=last_validation_error,
+    )
+    raise AssertionError("unreachable")
+
+
 async def call_llm(
     prompt: str,
     system: str = "",
@@ -595,6 +709,13 @@ async def call_llm(
             system,
             caller,
             response_model=response_model,
+        )
+
+    if _use_anthropic_backend():
+        return await _call_claude_local(
+            prompt, system, caller,
+            response_model=response_model,
+            timeout_seconds=timeout_seconds,
         )
 
     return await _call_k2_local(
