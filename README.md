@@ -1,4 +1,5 @@
 # Unilert — Live EMS / ICS Coordination on Dedalus Machines
+# **HackPrinceton Spring 26 DedalusLabs Track Winner**
 
 Real-time emergency medical operations system for EMS supervisors, incident commanders, and hospital coordination leads.  
 Built with Next.js, FastAPI, a deterministic ICS decision engine, Dedalus Machines agent swarming, and K2 Think V2.
